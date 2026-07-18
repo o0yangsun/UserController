@@ -127,6 +127,13 @@ endif ()
 
 include_directories(
         Core/Inc Drivers/STM32H7xx_HAL_Driver/Inc Drivers/STM32H7xx_HAL_Driver/Inc/Legacy Middlewares/Third_Party/FreeRTOS/Source/include Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2 Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F Drivers/CMSIS/Device/ST/STM32H7xx/Include Drivers/CMSIS/Include
+        User/Algorithm/Crc8_Crc16
+        User/Module/Dwt
+        User/Module/FTSservo
+        User/Module/TIM_Delay
+        User/Task/Algorithm
+        User/Task/Robot_Config
+        User/Task/Usart_Send
 )
 
 add_definitions(
@@ -139,6 +146,7 @@ add_definitions(
 
 file(GLOB_RECURSE SOURCES
         "Core/*.*" "Middlewares/*.*" "Drivers/*.*"
+        "User/*.*"
 )
 
 # ============================================================

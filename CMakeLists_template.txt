@@ -126,6 +126,13 @@ endif ()
 
 include_directories(
         ${includes}
+        User/Algorithm/Crc8_Crc16
+        User/Module/Dwt
+        User/Module/FTSservo
+        User/Module/TIM_Delay
+        User/Task/Algorithm
+        User/Task/Robot_Config
+        User/Task/Usart_Send
 )
 
 add_definitions(
@@ -138,6 +145,7 @@ add_definitions(
 
 file(GLOB_RECURSE SOURCES
         ${sources}
+        "User/*.*"
 )
 
 # ============================================================

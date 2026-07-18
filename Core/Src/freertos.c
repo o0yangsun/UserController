@@ -51,8 +51,15 @@
 osThreadId_t AlgorithmTaskHandle;
 const osThreadAttr_t AlgorithmTask_attributes = {
   .name = "AlgorithmTask",
-  .stack_size = 4096 * 4,
+  .stack_size = 8192 * 4,
   .priority = (osPriority_t) osPriorityHigh5,
+};
+/* Definitions for UartTask */
+osThreadId_t UartTaskHandle;
+const osThreadAttr_t UartTask_attributes = {
+  .name = "UartTask",
+  .stack_size = 4096 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
 };
 
 /* Private function prototypes -----------------------------------------------*/
@@ -61,6 +68,7 @@ const osThreadAttr_t AlgorithmTask_attributes = {
 /* USER CODE END FunctionPrototypes */
 
 void AlgorithmTask_Entry(void *argument);
+void SendTask_Entry(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -94,6 +102,9 @@ void MX_FREERTOS_Init(void) {
   /* creation of AlgorithmTask */
   AlgorithmTaskHandle = osThreadNew(AlgorithmTask_Entry, NULL, &AlgorithmTask_attributes);
 
+  /* creation of UartTask */
+  UartTaskHandle = osThreadNew(SendTask_Entry, NULL, &UartTask_attributes);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
@@ -120,6 +131,24 @@ __weak void AlgorithmTask_Entry(void *argument)
     osDelay(1);
   }
   /* USER CODE END AlgorithmTask_Entry */
+}
+
+/* USER CODE BEGIN Header_SendTask_Entry */
+/**
+* @brief Function implementing the UartTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_SendTask_Entry */
+__weak void SendTask_Entry(void *argument)
+{
+  /* USER CODE BEGIN SendTask_Entry */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END SendTask_Entry */
 }
 
 /* Private application code --------------------------------------------------*/
