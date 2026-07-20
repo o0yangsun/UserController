@@ -51,14 +51,14 @@
 osThreadId_t AlgorithmTaskHandle;
 const osThreadAttr_t AlgorithmTask_attributes = {
   .name = "AlgorithmTask",
-  .stack_size = 8192 * 4,
+  .stack_size = 2048 * 4,
   .priority = (osPriority_t) osPriorityHigh5,
 };
 /* Definitions for UartTask */
 osThreadId_t UartTaskHandle;
 const osThreadAttr_t UartTask_attributes = {
   .name = "UartTask",
-  .stack_size = 4096 * 4,
+  .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 

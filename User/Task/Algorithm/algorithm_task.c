@@ -16,9 +16,9 @@
 #include "drv_dwt.h"
 #include "robot.h"
 
-STS3215_Encoder_t sts3215_encoder[6] = {0};
+STS3215_Encoder_t sts3215_encoder;
 
-float angles[6] = {0};
+float angles = 0;
 
 /* -------------------------------- 调试监测变量 --------------------------------- */
 static float algorithm_task_dt = 0;
@@ -46,20 +46,18 @@ void AlgorithmTask_Entry(void const *argument)
     //  设定编码器2048中点值
     //  延时10ms
     //  初始化STS3215结构体并记录首次原始刻度作为零点
-    for (uint8_t i = 0; i < 6; i++)
-    {
-        STS3215_Init(&sts3215_encoder[i]);
+        STS3215_Init(&sts3215_encoder);
         HAL_Delay(10);
-        if(CalibrationOfs(i+1))
+        if(Calibration(1))
         {
-            sts3215_encoder[i].is_initialized = 1;
+            sts3215_encoder.is_initialized = 1;
         }
         else
         {
-            sts3215_encoder[i].is_initialized = -1;
+            sts3215_encoder.is_initialized = -1;
         }
         HAL_Delay(10);
-    }
+
     /* -------------------------------- 外设初始化段落 ------------------------------- */
 
     /* -------------------------------- 调试监测线程调度 --------------------------------- */
@@ -78,13 +76,12 @@ void AlgorithmTask_Entry(void const *argument)
         //  电机实例结构体更新
         sts3215_angle_get();
 
-        for (int i = 0; i < 6; i++)
-        {
-            angles[i] = sts3215_encoder[i].total_angle;
-        }
+
+            angles = sts3215_encoder.total_angle;
+        
 
         // 将编码器数据放入队列
-        xQueueSend(xQueue, angles, 0);
+        xQueueSend(xQueue, &angles, 0);
 
         /* -------------------------------- 线程代码编写段落 ------------------------------- */
 

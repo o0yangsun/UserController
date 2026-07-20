@@ -92,6 +92,16 @@ int CalibrationOfs(uint8_t ID)
 	return writeByte(ID, SMS_STS_TORQUE_ENABLE, 128);
 }
 
+int Calibration(uint8_t ID)
+{
+	uint8_t PositionH = 0;
+
+	rFlushSCS();
+	writeBuf(ID, 0, &PositionH, 1, INST_OFSCAL);
+	wFlushSCS();
+	return Ack(ID);
+}
+
 int unLockEpromEx(uint8_t ID)
 {
 	return writeByte(ID, SMS_STS_LOCK, 0);

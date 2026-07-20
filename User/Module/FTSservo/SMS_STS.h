@@ -59,6 +59,7 @@ extern void SyncWritePosEx(uint8_t ID[], uint8_t IDN, int16_t Position[], uint16
 extern int WheelMode(uint8_t ID);//恒速模式
 extern int WriteSpe(uint8_t ID, int16_t Speed, uint8_t ACC);//恒速模式控制指令
 extern int CalibrationOfs(uint8_t ID);//中位校准
+extern int Calibration(uint8_t ID);//将当前位置校准为位置0
 extern int unLockEpromEx(uint8_t ID);
 extern int LockEpromEx(uint8_t ID);
 #endif

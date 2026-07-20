@@ -35,8 +35,8 @@ static uint8_t dma_tx_buffer[2][FRAME_SIZE]; // 双缓冲区
 static volatile uint8_t current_buffer = 0;  // 当前缓冲区索引
 volatile uint8_t dma_busy = 0;                        // DMA状态标志位
 
-static float angles_send[6] = {0.0f};                // 用于临时存储队列中读取的编码器值
-static float encoder_values[6] = {0, 0, 0, 0, 0, 0}; // 存储6个编码器值
+static float angles_send = 0.0f;                // 用于临时存储队列中读取的编码器值
+static float encoder_values = 0.0f; // 存储6个编码器值
 
 extern QueueHandle_t xQueue; // FreeRTOS 队列句柄
 
@@ -59,12 +59,11 @@ void PackData(float *values, uint16_t data_length, RobotArmController_t *tx_data
 
     // 数据区：6个float（每个编码器值4字节）
     // 设置数据段
-    for (int i = 0; i < 6; i++)
-    {
-        uint8_t *src = (uint8_t *)&values[i];
-        uint8_t *dst = &tx_data->data[i * 4];
+
+        uint8_t *src = (uint8_t *)values;
+        uint8_t *dst = &tx_data->data[4];
         memcpy(dst, src, sizeof(float)); // 自动处理4个字节
-    }
+    
 
     // 计算帧尾CRC16
     tx_data->frame_tail = 0;                                // 初始CRC16
@@ -113,17 +112,16 @@ void SendTask_Entry(void const *argument)
         /* -------------------------------- 线程代码编写段落 ------------------------------- */
 
         // 从队列中获取编码器值
-        if (xQueueReceive(xQueue, angles_send, 0) == pdTRUE)
+        if (xQueueReceive(xQueue, &angles_send, 0) == pdTRUE)
         {
             // 更新全局的 encoder_values 数组（可选）
-            for (int i = 0; i < 6; i++)
-            {
-                encoder_values[i] = angles_send[i];
-            }
+            
+                encoder_values = angles_send;
+            
 
             // 打包数据到tx_data结构中
             RobotArmController_t tx_data = {0};     // 定义数据包结构体
-            PackData(encoder_values, 30, &tx_data); // 打包数据帧
+            PackData(&encoder_values, 30, &tx_data); // 打包数据帧
             // 将打包后的数据写入DMA缓冲区
             memcpy(dma_tx_buffer[current_buffer], &tx_data, FRAME_SIZE);
             // 启动 DMA 发送
