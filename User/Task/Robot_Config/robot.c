@@ -11,7 +11,7 @@ TIM_HandleTypeDef htim2;
 QueueHandle_t xQueue = NULL;
 
 #define QUEUE_LENGTH 10
-#define QUEUE_ITEM_SIZE sizeof(float)
+#define QUEUE_ITEM_SIZE sizeof(ServoFeedback_t)
 
 void robot_init(void)
 {

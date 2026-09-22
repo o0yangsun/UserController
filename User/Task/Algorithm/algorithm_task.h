@@ -7,8 +7,7 @@
 
 #include "STS_Module.h"
 
-extern STS3215_Encoder_t sts3215_encoder;
-
+extern STS3215_Encoder_t sts3215_encoder[STS3215_NUM];
 
 
 

@@ -190,4 +190,19 @@ void TIM6_DAC_IRQHandler(void)
 
 /* USER CODE BEGIN 1 */
 
+/* USART10 句柄定义在 usart.c（本文件未包含 usart.h，故此处显式声明） */
+extern UART_HandleTypeDef huart10;
+
+/**
+  * @brief This function handles USART10 global interrupt.
+  * @note  必须存在！HAL_UART_Transmit_DMA() 的完成回调 HAL_UART_TxCpltCallback()
+  *        是在 USART 的 TC 中断处理里被调用的（DMA 完成中断只负责使能 TC 中断）。
+  *        缺了这个 handler（以及 MspInit 里的 NVIC 使能），DMA 发送会永久卡在
+  *        BUSY_TX、dma_busy 恒为 1，后续帧全部发不出去。
+  */
+void USART10_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart10);
+}
+
 /* USER CODE END 1 */

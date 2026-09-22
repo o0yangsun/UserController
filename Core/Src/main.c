@@ -98,6 +98,38 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART10_UART_Init();
   /* USER CODE BEGIN 2 */
+  /* ★★ 使能板上"对外 5V"输出 —— 达妙 DM-MC02(DM-MC-Board02) 必须显式使能 ★★
+   *
+   * 依据（官方资料）：
+   *   · 说明书《DM-MC-Board02 电机开发板使用说明书 V1.0》§7 PWM 接口原文：
+   *     "为这 4 路 PWM 一起提供高达 5V@2A 驱动能力的电源（**该电源为可控，需使能输出后使用**）"；
+   *   · §1 电源树："一路可控 DCDC 5V 输出，用于给 **4 路 PWM、一路串口和一路 CAN 接口**供电"；
+   *   · 官方原理图：对外 5V 由 DCDC(U10) 产生，其 ENA 由 MCU 信号 `Power_5V_EN` 控制；
+   *   · 官方 BSP（yssickjgd/damiao_mc02_bsp, bsp_power.h）定义：
+   *         DC5__OUTPUT_GPIO_Port = GPIOC,  DC5__OUTPUT_Pin = GPIO_PIN_15
+   *     即 **PC15 = 高  →  对外 5V 开启**；PC14/PC13 对应两路可控 24V 输出。
+   *
+   * 现象对照：未使能时该 5V 轨不输出，用万用表量 PWM/串口排针的 VCC 只有约 2.1V
+   *           （由 MCU 的 TX 等引脚经保护二极管"倒灌"形成的幻电压），
+   *           外接模块（无线串口模块等）因无供电而完全不工作。
+   *
+   * 注：PC13/PC14（DA24V_0/1）为两路可控 24V 输出，本控制器未使用 —— 一并配成推挽输出并保持低电平，
+   *     避免引脚悬空导致 PMOS 栅极状态不确定。 */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  {
+    GPIO_InitTypeDef power_en = {0};
+    power_en.Mode  = GPIO_MODE_OUTPUT_PP;
+    power_en.Pull  = GPIO_NOPULL;
+    power_en.Speed = GPIO_SPEED_FREQ_LOW;
+
+    power_en.Pin = GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15; /* DC24_1 / DC24_0 / DC5 */
+    HAL_GPIO_Init(GPIOC, &power_en);
+
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);  /* 24V_OUT1 关 */
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_14, GPIO_PIN_RESET);  /* 24V_OUT2 关 */
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, GPIO_PIN_SET);    /* ★ 对外 5V 开 */
+  }
+
   robot_init();
   /* USER CODE END 2 */
 

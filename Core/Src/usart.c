@@ -214,6 +214,19 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
 
   /* USER CODE BEGIN USART10_MspInit 1 */
 
+  /* ★ USART10 全局中断必须使能 —— 否则 DMA 发送会永久卡死。
+   * 原因：HAL_UART_Transmit_DMA() 的完成通知是"两段式"的：
+   *   ① DMA1_Stream0 传输完成中断（NVIC 已使能）→ UART_DMATransmitCplt()
+   *        它只做一件事：使能 USART 的 TC(Transmit Complete) 中断；
+   *   ② USART10 的 TC 中断 → USART10_IRQHandler() → HAL_UART_IRQHandler()
+   *        这里才会真正调用 HAL_UART_TxCpltCallback() → 我们在那里把 dma_busy 清 0。
+   * 缺了下面这两行，② 永远等不到 → HAL 状态机停在 BUSY_TX、dma_busy 恒为 1
+   * → send_task 里 `if (dma_busy == 0)` 这道门从此关闭，后续帧只打包不发送
+   * （表现为：串口 0 字节、CH340 的 RX 灯常亮、current_buffer 不再切换）。
+   * 注：若之后用 CubeMX 重新生成，请勾选 USART10 的 global interrupt。 */
+  HAL_NVIC_SetPriority(USART10_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(USART10_IRQn);
+
   /* USER CODE END USART10_MspInit 1 */
   }
 }

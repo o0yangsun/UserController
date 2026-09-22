@@ -1,0 +1,36 @@
+# ===== 编译产物 =====
+cmake-build-*/
+build/
+Debug/
+Release/
+*.o
+*.obj
+*.obj.d
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.su
+*.pdb
+
+# ===== IDE / 工具临时文件 =====
+.idea/
+.vscode/
+mx.scratch
+*.ioc.bak
+*.mxproject.bak
+
+# ===== AI / 本地工具目录 =====
+.claude/
+.agents/
+
+# ===== 日志与临时文件 =====
+*.log
+*.tmp
+
+# ===== 系统文件 =====
+Thumbs.db
+Desktop.ini
+.DS_Store

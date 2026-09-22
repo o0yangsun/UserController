@@ -1,10 +1,10 @@
 //
-// Created by Áõ¼Î¿¡ on 25-2-19.
+// Created by åˆ˜å˜‰ä¿Š on 25-2-19.
 //
 
 #include "crc8_crc16.h"
 const uint8_t CRC8_INIT = 0xff;
-// CRC8²éÕÒ±í
+// CRC8æŸ¥æ‰¾è¡¨
 const uint8_t CRC8_table[256] = {
         0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83, 0xc2, 0x9c, 0x7e, 0x20, 0xa3, 0xfd, 0x1f, 0x41,
         0x9d, 0xc3, 0x21, 0x7f, 0xfc, 0xa2, 0x40, 0x1e, 0x5f, 0x01, 0xe3, 0xbd, 0x3e, 0x60, 0x82, 0xdc,
@@ -25,7 +25,7 @@ const uint8_t CRC8_table[256] = {
 };
 
 uint16_t CRC16_INIT = 0xffff;
-// CRC16²éÕÒ±í
+// CRC16æŸ¥æ‰¾è¡¨
 const uint16_t wCRC_table[256] = {
         0x0000, 0x1189, 0x2312, 0x329b, 0x4624, 0x57ad, 0x6536, 0x74bf,
         0x8c48, 0x9dc1, 0xaf5a, 0xbe53, 0xca6c, 0xdbe5, 0xe97e, 0xf8f7,
@@ -61,7 +61,7 @@ const uint16_t wCRC_table[256] = {
         0x7bc7, 0x6a4e, 0x58d5, 0x495c, 0x3de3, 0x2c6a, 0x1ef1, 0x0f78
 };
 
-// ¼ÆËãCRC8Ğ£ÑéºÍ
+// è®¡ç®—CRC8æ ¡éªŒå’Œ
 uint8_t get_CRC8_check_sum(unsigned char *pch_message, unsigned int dw_length, unsigned char ucCRC8)
 {
     unsigned char uc_index;
@@ -73,37 +73,37 @@ uint8_t get_CRC8_check_sum(unsigned char *pch_message, unsigned int dw_length, u
     return ucCRC8;
 }
 
-// Ğ£ÑéCRC8Ğ£ÑéºÍ
+// æ ¡éªŒCRC8æ ¡éªŒå’Œ
 uint32_t verify_CRC8_check_sum(unsigned char *pch_message, unsigned int dw_length)
 {
     unsigned char ucExpected = 0;
     if ((pch_message == 0) || (dw_length <= 2))
     {
-        return 0; // ²ÎÊıÎŞĞ§
+        return 0; // å‚æ•°æ— æ•ˆ
     }
     ucExpected = get_CRC8_check_sum(pch_message, dw_length - 1, CRC8_INIT);
-    return (ucExpected == pch_message[dw_length - 1]); // ·µ»ØĞ£Ñé½á¹û
+    return (ucExpected == pch_message[dw_length - 1]); // è¿”å›æ ¡éªŒç»“æœ
 }
 
-// ½«CRC8Ğ£ÑéºÍÌí¼Óµ½Êı¾İÄ©Î²
+// å°†CRC8æ ¡éªŒå’Œæ·»åŠ åˆ°æ•°æ®æœ«å°¾
 void append_CRC8_check_sum(unsigned char *pch_message, unsigned int dw_length)
 {
     unsigned char ucCRC = 0;
     if ((pch_message == 0) || (dw_length <= 2))
     {
-        return; // ²ÎÊıÎŞĞ§
+        return; // å‚æ•°æ— æ•ˆ
     }
     ucCRC = get_CRC8_check_sum((unsigned char *)pch_message, dw_length - 1, CRC8_INIT);
-    pch_message[dw_length - 1] = ucCRC; // ½«CRC8ÖµÌí¼Óµ½Êı¾İÄ©Î²
+    pch_message[dw_length - 1] = ucCRC; // å°†CRC8å€¼æ·»åŠ åˆ°æ•°æ®æœ«å°¾
 }
 
-// ¼ÆËãCRC16Ğ£ÑéºÍ
+// è®¡ç®—CRC16æ ¡éªŒå’Œ
 uint16_t get_CRC16_check_sum(uint8_t *pch_message, uint32_t dw_length, uint16_t wCRC)
 {
     uint8_t chData;
     if (pch_message == NULL)
     {
-        return 0xFFFF; // ²ÎÊıÎŞĞ§
+        return 0xFFFF; // å‚æ•°æ— æ•ˆ
     }
     while(dw_length--)
     {
@@ -113,27 +113,27 @@ uint16_t get_CRC16_check_sum(uint8_t *pch_message, uint32_t dw_length, uint16_t 
     return wCRC;
 }
 
-// Ğ£ÑéCRC16Ğ£ÑéºÍ
+// æ ¡éªŒCRC16æ ¡éªŒå’Œ
 uint32_t verify_CRC16_check_sum(uint8_t *pchMessage, uint32_t dwLength)
 {
     uint16_t wExpected = 0;
     if ((pchMessage == NULL) || (dwLength <= 2))
     {
-        return 0; // ²ÎÊıÎŞĞ§
+        return 0; // å‚æ•°æ— æ•ˆ
     }
     wExpected = get_CRC16_check_sum(pchMessage, dwLength - 2, CRC16_INIT);
     return ((wExpected & 0xff) == pchMessage[dwLength - 2] && ((wExpected >> 8) & 0xff) == pchMessage[dwLength - 1]);
 }
 
-// ½«CRC16Ğ£ÑéºÍÌí¼Óµ½Êı¾İÄ©Î²
+// å°†CRC16æ ¡éªŒå’Œæ·»åŠ åˆ°æ•°æ®æœ«å°¾
 void append_CRC16_check_sum(uint8_t * pchMessage, uint32_t dwLength)
 {
     uint16_t wCRC = 0;
     if ((pchMessage == NULL) || (dwLength <= 2))
     {
-        return; // ²ÎÊıÎŞĞ§
+        return; // å‚æ•°æ— æ•ˆ
     }
     wCRC = get_CRC16_check_sum((uint8_t *)pchMessage, dwLength - 2, CRC16_INIT);
     pchMessage[dwLength - 2] = (uint8_t)(wCRC & 0x00ff);
-    pchMessage[dwLength - 1] = (uint8_t)((wCRC >> 8) & 0x00ff); // ½«CRC16ÖµÌí¼Óµ½Êı¾İÄ©Î²
+    pchMessage[dwLength - 1] = (uint8_t)((wCRC >> 8) & 0x00ff); // å°†CRC16å€¼æ·»åŠ åˆ°æ•°æ®æœ«å°¾
 }

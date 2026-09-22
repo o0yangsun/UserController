@@ -11,7 +11,14 @@
 #include "FreeRTOS.h"       // 提供 FreeRTOS 基础类型
 #include "queue.h"           // 提供 QueueHandle_t
 #include "cmsis_os.h"       // 使用的 OS 头文件
+#include "STS_Module.h"     // 提供 STS3215_NUM
 
+/* 舵机编码器反馈帧（algorithm → usart_send 队列传递的单元） */
+typedef struct
+{
+    float   angle[STS3215_NUM]; // 各舵机累计角度(低通滤波后)
+    uint8_t valid;              // 1=本轮全部通道读到有效刻度；0=至少一路失败(帧内失败通道保留旧值)
+} ServoFeedback_t;
 
 extern QueueHandle_t xQueue;    //algorithm和usart_send的队列
 void robot_init(void);
