@@ -42,6 +42,9 @@
 ```
 
 > 注：本仓库只负责"操作手 → 无线"这一段。车端解析与机械臂驱动在另一个仓库。
+>
+> 另有一条**独立的 PC 调试通道**：`USB_OTG_HS`（内置 FS PHY + HSI48，无需外部晶振）虚拟串口，
+> PC 可直读 6 关节角、下发目标角与使能命令 —— 见 **§14**。两条通道互不影响。
 
 ---
 
@@ -54,6 +57,7 @@
 | 浮点 | `-mfpu=fpv5-d16 -mfloat-abi=hard` |
 | **USART1（舵机总线）** | **1 000 000 bps, 8N1**，PA9 TX / PA10 RX，AF7，阻塞式 HAL |
 | **USART10（无线上行）** | **115 200 bps, 8N1**，PE3 TX / PE2 RX，DMA1_Stream0 |
+| **USB_OTG_HS（PC 调试口）** | **内置 FS PHY**，时钟源 **HSI48**（须使能），无需外部晶振/PHY/引脚；中断 `OTG_HS_IRQn` 优先级 5 |
 | 对外电源 | **PC15 = 高 → 对外 5 V 使能**（达妙板为可控输出，必须软件使能）；PC13/PC14 = 两路 24 V，本控制器关闭 |
 | 系统时基 | TIM6（`HAL_IncTick`）+ DWT 微秒级计时（`drv_dwt`） |
 | 调试链 | OpenOCD + CMSIS-DAP / ST-Link + `arm-none-eabi-gdb`；可配合 OctoLink MCP Bridge 在线读写变量 |
@@ -323,3 +327,92 @@ arm-none-eabi-gdb build/STM32H7232_UserController.elf
 
 - 车端固件：`Engineering_Robot_H723_`（团队仓库 `poppywork/Engineering_Robot_H723_`）
 - 本控制器：<https://github.com/o0yangsun/UserController>
+
+---
+
+## 14. PC ↔ 主臂 USB CDC 链路（`0x60` / `0x61` / `0x62`）
+
+移植自车端，用于 **PC 直连主臂板**：读 6 关节角（数据采集）、下发目标角与使能命令（HIL 干预）。
+USB 是**第三条独立通道**，USART1（舵机总线）与 USART10（0x0302 上行）不受影响。
+
+### 14.1 硬件与驱动
+
+| 项 | 说明 |
+| --- | --- |
+| 外设 | `USB_OTG_HS` + **内置 FS PHY**（`HAL_PCD_MspInit()` 里没有任何 `HAL_GPIO_Init`） |
+| 时钟 | **HSI48**（`RCC_USBCLKSOURCE_HSI48`）—— 见 `usbd_conf.c` |
+| 驱动位置 | `USB_DEVICE/`（App + Target）、`Middlewares/ST/STM32_USB_Device_Library/`、HAL 的 `stm32h7xx_hal_pcd*` / `stm32h7xx_ll_usb*` |
+| 中断 | `OTG_HS_IRQHandler()` 在 `stm32h7xx_it.c`（覆盖启动文件里的 weak 定义） |
+| 初始化 | `MX_USB_DEVICE_Init()` 在 `main.c`，**全工程只调用这一处** |
+
+> ⚠️ **两个移植时最容易漏、且症状隐蔽的点**（文档 `PORTING.md` 未列出）：
+> 1. **HAL 的 PCD/LL_USB 驱动层**（6 个文件）—— 缺了直接链接失败。
+> 2. **`HSI48` 必须在 `SystemClock_Config()` 里使能** —— 不开则 USB 的时钟源形同虚设，
+>    PC 上不出现 COM 口，而 HAL 不一定报错。
+> 另外 `stm32h7xx_hal_conf.h` 里的 `HAL_PCD_MODULE_ENABLED` 原本是注释状态。
+
+### 14.2 帧格式（与车端完全一致）
+
+```
+偏移     字段        长度   说明
+[0]     帧头         1     固定 0xFF
+[1]     地址         1     固定 0x05
+[2]     命名ID       1     见下表
+[3]     数据长度     1     仅"数据段"字节数 N
+[4..]   数据         N
+[N+4]   sum_check    1     Σbuf[0..N+3] & 0xFF
+[N+5]   addr_check   1     Σ(sum_check) & 0xFF（累加和的低 8 位）
+```
+
+帧总长 = `4 + N + 2`。
+
+### 14.3 命名 ID
+
+车端占用 `0x1x / 0x2x / 0x3x`，主臂走 **`0x6x`** 段，同一台 PC 抓包时一眼可分。
+
+| ID | 方向 | 用途 | 数据长 | 帧长 |
+| --- | --- | --- | ---: | ---: |
+| `0x60` | 主臂 → PC | 6 关节角 + 使能状态 | 25 | 31 |
+| `0x61` | PC → 主臂 | 6 个目标关节角 + 生效标志 | 25 | 31 |
+| `0x62` | PC → 主臂 | 使能 / 失能 | 1 | 7 |
+
+### 14.4 数据段
+
+**`0x60` 上行**
+
+| 偏移 | 类型 | 内容 |
+| ---: | --- | --- |
+| 0 / 4 / 8 / 12 / 16 / 20 | `int32` ×6 | J1~J6 关节角，**弧度 × 10000**（小端） |
+| 24 | `int8` | 使能状态：1 = 锁死，0 = 自由 |
+
+**`0x61` 下行**：偏移 0~23 = 6 × `int32`（**弧度 × 10000**），偏移 24 = 标志（1 = 立即生效）。
+**`0x62` 下行**：偏移 0 = `int8`（1 = 使能，0 = 失能）。
+
+> ★ **单位转换在主臂固件内部完成**（`User/Module/Usb_Pc/usb_pc_link.c`）：
+> 上行打包时 `度 → 弧度×10000`，下行解析时 `弧度×10000 → 度`。
+> 主臂内部一律用度，PC 侧一律用弧度 —— 这样 PC 上解析车端 `0x20` 与主臂 `0x60` 可以用同一套代码。
+
+### 14.5 代码位置与行为
+
+| 项 | 位置 / 说明 |
+| --- | --- |
+| 协议实现 | `User/Module/Usb_Pc/usb_pc_link.c/.h` |
+| 挂载点 | `algorithm_task.c` 主循环、**组帧入队之后**（不影响 0x0302 节拍） |
+| 上报周期 | `usb_pc_report_ms = 30`（`volatile`，可用调试器在线改） |
+| 发送失败策略 | `CDC_Transmit_HS()` 返回 `USBD_BUSY` 时**丢弃本帧、不重试**（沿用车端策略） |
+| `0x61` 目标角 | **只解析存入 `usb_pc_target_deg[]`，不驱动舵机** —— 写目标的应用逻辑尚未开发 |
+| `0x62` 使能 | 复用按键那条 `sts3215_set_torque_all()` 通路，保证扭矩状态只有一个权威来源 |
+| 调试计数 | `usb_pc_tx_cnt` / `tx_busy_cnt` / `rx_cnt` / `rx_bad_cnt` / `last_id` / `tick` |
+
+### 14.6 PC 侧工具
+
+```bash
+pip install pyserial
+python tools/pc_arm_monitor.py                 # 列出串口
+python tools/pc_arm_monitor.py COM7 --deg      # 持续监视（角度制）
+python tools/pc_arm_monitor.py COM7 --enable 1 # 发 0x62 使能
+python tools/pc_arm_monitor.py COM7 --target 0.1 0.2 0.3 0.4 0.5 0.6   # 发 0x61（弧度）
+```
+
+内置的 `StreamParser` 是**字节流解析器**（能吃粘包/断包，校验失败只丢 1 字节重新同步），
+不假设一次 `read()` 恰好等于一帧。
