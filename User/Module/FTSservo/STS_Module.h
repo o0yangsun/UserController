@@ -26,6 +26,35 @@
  *       而校准跳变幅度是数百~2048 刻度,必然被判为"跳变"并重新建立。 */
 #define STS3215_BASE_TOL 16
 
+/* ============================ KEY 按键(PA15) 配置 ============================
+ * 硬件：达妙 DM-MC-Board02 板载按键。官方 BSP 中定义为
+ *       KEY__INPUT_Pin = GPIO_PIN_15 / KEY__INPUT_GPIO_Port = GPIOA
+ *       (见 dm_bsp/damiao_mc02_bsp/dm02_mouse_test/Core/Inc/main.h)
+ * 功能：按一次 → 六路舵机扭矩使能(锁死)；再按一次 → 失能(回到上电默认的自由态)。
+ *
+ * ★★ 极性 —— 2026-09-26 已实机实测确认，当前值就是对的，无需再改 ★★
+ *      1 = 按下时 PA15 为【低】电平   ← 实测结果，即本处取值
+ *      0 = 按下时 PA15 为【高】电平
+ *
+ *   实测证据（OctoLink 记录 sts3215_key_dbg_high_cnt / _low_cnt，34s 覆盖 5 次按键）：
+ *       · 松开期间：high_cnt 以 +20/0.5s 稳定增长，low_cnt 完全不动
+ *       · 按下期间：low_cnt 以 +20/0.5s 增长，high_cnt 【完全冻结】
+ *     ⇒ 松开 = 高电平、按下 = 低电平 ⇒ 按下为低 ⇒ 本宏应为 1（与当前值一致）
+ *
+ *   为什么不能从代码推断：达妙 BSP 里这个引脚**只声明、从未读取过**，
+ *   且配置为 GPIO_MODE_INPUT + GPIO_NOPULL，无法判断有效电平。
+ *
+ *   若将来换板子/换按键导致极性相反（症状：按下去没反应、松手才切换），
+ *   把本宏改成 0 即可；不想重烧也可以 —— 直接用调试器把运行期变量
+ *   sts3215_key_active_low 写成 0，逻辑立刻翻转。
+ *
+ *   复测方法：烧录后不碰按键跑几秒，读 sts3215_key_dbg_high_cnt / sts3215_key_dbg_low_cnt，
+ *   计数大的那个电平就是"松开"时的空闲电平。 */
+#define STS3215_KEY_ACTIVE_LOW      1
+
+/* 按键去抖时间(ms)。与任务节拍解耦(用 HAL_GetTick 计时)，改任务周期不用动这里。 */
+#define STS3215_KEY_DEBOUNCE_MS     20u
+
 /* 舵机 ID 列表 (定义于 STS_Module.c) */
 extern uint8_t motor_ids[STS3215_NUM];
 
@@ -62,4 +91,47 @@ void STS3215_Init(STS3215_Encoder_t *encoder, int32_t base_encoder_value);
 int  sts3215_calib_mid(uint8_t id);
 int  sts3215_encoder_get(uint8_t idx);   // 返回 0=成功读到有效刻度；-1=失败(舵机未接/握手失败/越界)
 void sts3215_angle_get(uint8_t idx);
+
+/* ---------------- KEY 按键(PA15)：锁死 / 自由 切换 ---------------- */
+
+/* 运行期极性开关：初值 = STS3215_KEY_ACTIVE_LOW。
+ * 可用调试器(OctoLink/GDB)直接改写做对比实验，不必重新烧录 ——
+ * 这样一次烧录就能把两种极性都试出来。
+ *   1 = 按下为低电平 ; 0 = 按下为高电平 */
+extern volatile uint8_t  sts3215_key_active_low;
+
+/* 极性自诊断计数器：上电起累计采样到的高/低电平次数。
+ * 【不碰按键】时读这两个值，谁大谁就是"松开"时的空闲电平。
+ * 注意：只在 sts3215_key_poll() 被调用时累加，所以要在主循环跑起来之后读。 */
+extern volatile uint32_t sts3215_key_dbg_high_cnt;
+extern volatile uint32_t sts3215_key_dbg_low_cnt;
+
+/* 扭矩锁定状态：1 = 锁死(扭矩使能)，0 = 自由(失能)。
+ * 上电默认 0 —— 与本次改动前的行为完全一致。 */
+extern volatile uint8_t  sts3215_locked;
+
+/* 最近一次切换实际成功的路数(0~6)，供调试观察。 */
+extern volatile uint8_t  sts3215_lock_ok_count;
+
+/* 配置 PA15 为输入(内部上下拉方向跟随 STS3215_KEY_ACTIVE_LOW)。上电时调用一次。
+ * 注：GPIOA 时钟已在 MX_GPIO_Init() 里打开；PA15 复位默认是 JTDI，本工程调试口只用
+ *     SWD(PA13/PA14)，故可安全当 GPIO 用。 */
+void    sts3215_key_init(void);
+
+/* 按键扫描：需在主循环里周期性调用。
+ * 返回 1 = 本次检测到一次"按下"沿(已去抖)；0 = 无事件。
+ * 【为什么轮询而不是外部中断】舵机总线是阻塞式 HAL(ftUart_Read 最坏阻塞 3ms)，
+ * 一次扭矩切换要 6 路 ×(读位置+写目标+写扭矩) ≈ 18 次总线事务，
+ * 在 ISR 里做会严重拖垮系统 —— 必须放在任务里。 */
+uint8_t sts3215_key_poll(void);
+
+/* 使能/失能单路舵机扭矩。enable: 1=锁死 0=自由。
+ * 返回 0=成功，-1=失败(通信失败/读数越界/下标越界)。 */
+int     sts3215_set_torque(uint8_t idx, uint8_t enable);
+
+/* 六路一起切换。返回实际成功的路数(0~6)。
+ * 只有 6 路**全部成功**才翻转 sts3215_locked —— 少一路就不翻，这样再按一次即重试；
+ * 而写同样的值本身是幂等的，所以可自愈。 */
+uint8_t sts3215_set_torque_all(uint8_t enable);
+
 #endif
