@@ -205,4 +205,19 @@ void USART10_IRQHandler(void)
   HAL_UART_IRQHandler(&huart10);
 }
 
+/* USB OTG HS 句柄定义在 USB_DEVICE/Target/usbd_conf.c
+ * （本文件未包含 usbd_conf.h，故此处显式声明，与上面的 huart10 同一套写法） */
+extern PCD_HandleTypeDef hpcd_USB_OTG_HS;
+
+/**
+  * @brief This function handles USB On The Go HS global interrupt.
+  * @note  USB CDC（PC 虚拟串口）的收发中断入口。缺了它 USB 无法枚举、也收不到 PC 的数据。
+  *        向量表里已有 weak 定义（startup_stm32h723vgtx.s），这里提供强符号覆盖它。
+  *        NVIC 使能在 HAL_PCD_MspInit() 里做（usbd_conf.c，优先级 5）。
+  */
+void OTG_HS_IRQHandler(void)
+{
+  HAL_PCD_IRQHandler(&hpcd_USB_OTG_HS);
+}
+
 /* USER CODE END 1 */

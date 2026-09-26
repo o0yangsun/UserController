@@ -131,9 +131,14 @@ include_directories(
         User/Module/Dwt
         User/Module/FTSservo
         User/Module/TIM_Delay
+        User/Module/Usb_Pc
         User/Task/Algorithm
         User/Task/Robot_Config
         User/Task/Usart_Send
+        # --- USB CDC 虚拟串口（PC ↔ 主臂板），移植自车端 Engineering_Robot_H723_ ---
+        USB_DEVICE/App USB_DEVICE/Target
+        Middlewares/ST/STM32_USB_Device_Library/Core/Inc
+        Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc
 )
 
 add_definitions(
@@ -144,8 +149,12 @@ add_definitions(
 # Source files
 # ============================================================
 
-file(GLOB_RECURSE SOURCES
+# CONFIGURE_DEPENDS：让 CMake 每次构建都重新扫描目录。
+# 否则 GLOB 结果在 configure 时就被固化了 —— 新增 .c 文件不会进构建，
+# 表现为"undefined reference to 新函数"，必须手工重新 configure 才能发现。
+file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
         "Core/*.*" "Middlewares/*.*" "Drivers/*.*"
+        "USB_DEVICE/*.*"
         "User/*.*"
 )
 

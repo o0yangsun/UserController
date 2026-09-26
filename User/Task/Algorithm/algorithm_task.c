@@ -18,6 +18,7 @@
 #include "cmsis_os.h"
 #include "drv_dwt.h"
 #include "robot.h"
+#include "usb_pc_link.h"   /* PC ↔ 主臂 USB CDC 链路 */
 
 /* 舵机编码器实例数组：每路保存独立的累计值与滤波状态 */
 STS3215_Encoder_t sts3215_encoder[STS3215_NUM];
@@ -169,6 +170,27 @@ void AlgorithmTask_Entry(void const *argument)
             servo_feedback = fb; // 调试镜像
             xQueueSend(xQueue, &fb, 0);
         }
+
+        /* ------------------------------ USB CDC：PC 链路 ------------------------------
+         * usb_pc_service() 每轮处理两件事（内部已限速，见 usb_pc_link.c）：
+         *   ① 轮询 PC 下发的命令（0x61 目标角 / 0x62 使能）
+         *   ② 按 usb_pc_report_ms 周期上报 0x60（6 关节角 + 使能状态，单位弧度）
+         * 放在【组帧入队】之后：不影响 0x0302 的节拍。
+         *
+         * 0x62 是 PC 请求使能/失能。这里复用按键那条通路（sts3215_set_torque_all），
+         * 保证"扭矩状态只有一个权威来源"，也免得两套逻辑互相打架。
+         * ⚠️ 0x61 的目标角只解析并存入 usb_pc_target_deg[]/usb_pc_target_flag，
+         *    【不驱动舵机】—— 主臂当前只读不写，写目标的应用逻辑尚未开发。 */
+        if (usb_pc_enable_req >= 0)
+        {
+            const uint8_t want = (uint8_t)usb_pc_enable_req;
+            usb_pc_enable_req  = -1;              /* 消费掉请求 */
+            if (want != sts3215_locked)
+            {
+                (void)sts3215_set_torque_all(want);
+            }
+        }
+        usb_pc_service();
 
         /* ------------------------------ KEY 按键(PA15)：锁死 / 自由 ------------------------------
          * 按一次：六路舵机扭矩使能(锁死)。此时操作手被刚性固定 → 角度随之冻结 →

@@ -26,6 +26,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "robot.h"
+#include "usb_device.h"   /* MX_USB_DEVICE_Init() —— USB CDC 虚拟串口 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -98,6 +99,10 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART10_UART_Init();
   /* USER CODE BEGIN 2 */
+  /* ★ USB CDC 虚拟串口初始化（PC ↔ 主臂板），全工程【只允许调用这一处】。
+   * 车端工程里它在 main.c 和 freertos.c 各调了一次，重复调用会让 USBD 句柄被反复重置。 */
+  MX_USB_DEVICE_Init();
+
   /* ★★ 使能板上"对外 5V"输出 —— 达妙 DM-MC02(DM-MC-Board02) 必须显式使能 ★★
    *
    * 依据（官方资料）：
@@ -181,8 +186,17 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  /* ★★ HSI48 必须打开 —— 这是 USB OTG HS 在 48MHz 上的时钟源 ★★
+   * 依据：usbd_conf.c 的 HAL_PCD_MspInit() 里写的是
+   *         PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_USB;
+   *         PeriphClkInitStruct.UsbClockSelection     = RCC_USBCLKSOURCE_HSI48;
+   *       即把 USB 时钟 mux 切到 HSI48。若 HSI48 没使能，等于选了个不跑的时钟，
+   *       USB 不会枚举（PC 上不出现 COM 口），而且 HAL 不一定报错 —— 极难排查。
+   * 注：HSI48 是芯片内部 RC 振荡器，配合内置 FS PHY 使用，不需要外部晶振/外部 PHY/额外引脚。
+   *     （车端 Engineering_Robot_H723_ 也是这么配的，已验证可用。） */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 3;
