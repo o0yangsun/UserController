@@ -22,6 +22,13 @@ mx.scratch
 *.ioc.bak
 *.mxproject.bak
 
+# ===== Python（tools/ 下的 PC 侧脚本）=====
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
 # ===== AI / 本地工具目录 =====
 .claude/
 .agents/
