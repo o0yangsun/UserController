@@ -3,6 +3,7 @@
 #include "SCSCL.h"
 #include "INST.h"
 #include "algorithm_task.h"
+#include "main.h"      /* HAL 库 + GPIO_PIN_x / GPIO_PULLx / HAL_Delay */
 #include <stdbool.h>
 
 /* 舵机 ID 表：对应总线上的 1~6 号舵机(顺序即数据帧里的通道顺序) */
@@ -193,4 +194,155 @@ void sts3215_angle_get(uint8_t idx)
     //  缓存当前刻度值与角度 供下次使用
     enc->last_encoder_value = enc->encoder_value; // 保存本次值供下次 diff 使用
     enc->last_total_angle = enc->total_angle;     // 保存值供下次滤波使用
+}
+
+/* ==========================================================================================
+ *                          KEY 按键(PA15)：舵机 锁死 / 自由 切换
+ * ==========================================================================================
+ * 硬件：达妙 DM-MC-Board02 板载按键 → PA15（BSP 里叫 KEY__INPUT）。
+ * 功能：按一次 → 六路舵机扭矩使能(锁死)；再按一次 → 失能(回到上电默认的自由态)。
+ *
+ * 为什么放在任务里轮询、不用外部中断：
+ *   舵机总线是阻塞式 HAL（ftUart_Read 最坏阻塞 3ms），一次扭矩切换 = 6 路 × (读位置+写目标+
+ *   写扭矩) ≈ 18 次总线事务。在 ISR 里做这个会严重拖垮系统。本任务循环已有约 3ms 节拍，
+ *   轮询的额外代价约等于一次 GPIO 读，可忽略。
+ * ========================================================================================== */
+
+/* 运行期极性开关：初值取编译期宏，可用调试器在线改写做对比实验 */
+volatile uint8_t  sts3215_key_active_low = STS3215_KEY_ACTIVE_LOW;
+
+/* 极性自诊断：累计采样到的高/低电平次数（上电后不碰按键，谁大谁是"松开"电平） */
+volatile uint32_t sts3215_key_dbg_high_cnt = 0;
+volatile uint32_t sts3215_key_dbg_low_cnt  = 0;
+
+/* 扭矩锁定状态。上电默认 0 = 自由/失能 —— 与本次改动前的行为一致 */
+volatile uint8_t  sts3215_locked        = 0;
+volatile uint8_t  sts3215_lock_ok_count = 0;
+
+/* 去抖状态（文件内私有） */
+static uint8_t  key_raw_last = 0;   /* 上一次采样到的"是否按下"(已按极性换算) */
+static uint8_t  key_stable   = 0;   /* 去抖后确认的稳定状态 */
+static uint32_t key_t_change = 0;   /* 原始状态最后一次发生变化的时刻 */
+static uint8_t  key_inited   = 0;   /* 首次调用标志：只采纳当前状态，不产生事件 */
+
+void sts3215_key_init(void)
+{
+    GPIO_InitTypeDef key = {0};
+
+    key.Pin  = GPIO_PIN_15;             /* PA15 */
+    key.Mode = GPIO_MODE_INPUT;
+    /* 内部上下拉朝"空闲(松开)"方向拉，保证按键松开时引脚电平确定、不浮空。
+     * 达妙 BSP 里配的是 GPIO_NOPULL，说明板上外部应该已有一只电阻；内部再拉只是并联，无害。
+     *   active_low=1（按下为低）→ 空闲应为高 → 上拉
+     *   active_low=0（按下为高）→ 空闲应为低 → 下拉
+     * 注意：这里用编译期宏而非运行期变量 —— 因为上电后不会再来重配这个引脚；
+     *       若想在线翻转逻辑，直接改 sts3215_key_active_low 即可（内部拉电阻方向不影响判定）。 */
+    key.Pull  = STS3215_KEY_ACTIVE_LOW ? GPIO_PULLUP : GPIO_PULLDOWN;
+
+    HAL_GPIO_Init(GPIOA, &key);
+}
+
+uint8_t sts3215_key_poll(void)
+{
+    /* 原始电平：1 = 高 */
+    const uint8_t  lvl = (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15) == GPIO_PIN_SET) ? 1u : 0u;
+    const uint32_t now = HAL_GetTick();
+
+    /* 极性自诊断计数 */
+    if (lvl) sts3215_key_dbg_high_cnt++;
+    else     sts3215_key_dbg_low_cnt++;
+
+    /* 换算成"是否按下"（极性由运行期变量决定，可在线改） */
+    const uint8_t raw = sts3215_key_active_low ? (uint8_t)(!lvl) : lvl;
+
+    /* 首次调用：只把当前状态采纳为初始状态，不产生任何事件。
+     * 此时 AlgorithmTask 已经跑完 ~600ms 的舵机初始化，引脚电平早已稳定；
+     * 这样也顺带避免了"上电瞬间引脚状态变化被误当成一次按键"。 */
+    if (!key_inited)
+    {
+        key_raw_last = raw;
+        key_stable   = raw;
+        key_t_change = now;
+        key_inited   = 1;
+        return 0;
+    }
+
+    /* 状态刚变：重新计时，暂不认定（这就是去抖） */
+    if (raw != key_raw_last)
+    {
+        key_raw_last = raw;
+        key_t_change = now;
+        return 0;
+    }
+
+    /* 状态已稳定超过去抖时间 → 认定为有效状态。只在"按下"这个沿产生事件，松手不触发。 */
+    if ((now - key_t_change) >= STS3215_KEY_DEBOUNCE_MS && key_stable != raw)
+    {
+        key_stable = raw;
+        if (raw)
+        {
+            return 1;   /* ★ 一次按下事件 */
+        }
+    }
+
+    return 0;
+}
+
+int sts3215_set_torque(uint8_t idx, uint8_t enable)
+{
+    int pos;
+
+    if (idx >= STS3215_NUM)
+    {
+        return -1;
+    }
+
+    const uint8_t id = motor_ids[idx];
+
+    if (enable)
+    {
+        /* ★★ 使能扭矩前必须先把 GOAL_POSITION 写成【当前实际位置】 ★★
+         * 原因：GOAL_POSITION(地址 42) 这个寄存器本控制器从来没写过（只读位置），
+         *       里面可能还残留上电默认值或很久以前的旧目标。直接置 TORQUE_ENABLE=1，
+         *       舵机会立刻朝那个陈旧目标猛冲一下 —— 这既危险又完全没必要。
+         *       先把 goal 写成当前位置，才是真正的"原地锁死"。
+         * 注：goal == 当前位置 ⇒ 舵机无需运动，后面那个速度参数取 0 不影响结果。 */
+        pos = ReadPos(id);
+        if (pos < 0 || pos > 4095)
+        {
+            return -1;      /* 读不到位置就绝不使能，宁可这路不锁，也不要它乱动 */
+        }
+        WritePosEx(id, (int16_t)pos, 0, 0);
+    }
+
+    /* 扭矩开关：地址 SMS_STS_TORQUE_ENABLE(40)，写 1=使能、0=失能。
+     * ⚠️ 别和 128 混用 —— 128 是"中位校准"触发值（见 sts3215_calib_mid()）。
+     * writeByte() 自带 rFlushSCS → writeBuf → wFlushSCS → Ack（SCS.c:185），
+     * 用不着手工刷总线，和 sts3215_calib_mid() 的做法等价。 */
+    return (writeByte(id, SMS_STS_TORQUE_ENABLE, enable ? 1u : 0u) != 0) ? 0 : -1;
+}
+
+uint8_t sts3215_set_torque_all(uint8_t enable)
+{
+    uint8_t ok = 0;
+
+    for (uint8_t i = 0; i < STS3215_NUM; i++)
+    {
+        if (sts3215_set_torque(i, enable) == 0)
+        {
+            ok++;
+        }
+        HAL_Delay(2);   /* 给舵机留一点处理时间，也避免总线上连发 */
+    }
+
+    sts3215_lock_ok_count = ok;
+
+    /* 只有六路全部成功才翻转逻辑状态：
+     * 少一路就不翻 → 再按一次会重试；而写同样的值本身幂等，故能自愈。 */
+    if (ok == STS3215_NUM)
+    {
+        sts3215_locked = enable ? 1u : 0u;
+    }
+
+    return ok;
 }

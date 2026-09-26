@@ -130,6 +130,12 @@ int main(void)
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, GPIO_PIN_SET);    /* ★ 对外 5V 开 */
   }
 
+  /* ★ KEY 按键(PA15)：达妙板载按键，配成输入。
+   * 功能：按一次 → 六路舵机扭矩使能(锁死)；再按一次 → 失能(回到自由态)。
+   * 实际扫描在 AlgorithmTask 里做（见 algorithm_task.c），这里只做引脚配置。
+   * 电平极性由 STS_Module.h 的 STS3215_KEY_ACTIVE_LOW 决定，两种极性都已在代码里备好。 */
+  sts3215_key_init();
+
   robot_init();
   /* USER CODE END 2 */
 
