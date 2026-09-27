@@ -81,9 +81,18 @@ volatile float    usb_pc_write_eps_deg    = 1.5f;
 volatile float    usb_pc_soft_min_deg[6] = {-85.0f, -170.0f, -170.0f, -170.0f, -170.0f, -170.0f};
 volatile float    usb_pc_soft_max_deg[6] = { 85.0f,  170.0f,  170.0f,  170.0f,  170.0f,  170.0f};
 
-/* 堵转保护：连续 N 次"命令了却几乎没位移"就停止驱动该路（默认 20 次 ≈ 0.6s） */
-volatile uint8_t  usb_pc_stall_limit    = 20;
-volatile float    usb_pc_stall_eps_deg  = 0.15f;
+/* 堵转保护：★ 2026-09-27 改为【按真实时间窗】判定，不再按"调用次数"。
+ * 原写法"连续 20 次调用位移 < eps"是按 30ms/次估的 0.6s，但本函数实际被主循环
+ * 每 3ms 调一次 ⇒ 真实窗口只有 60ms ⇒ 任何低于 50°/s 的正常运动都被误判成"卡住"，
+ * 关节被周期性跳过（实测 stall_cnt 涨到 711，且速度卡在 ~7°/s 上不去）。 */
+volatile uint8_t  usb_pc_stall_limit    = 20;     /* 已废弃，保留以兼容旧配置 */
+volatile uint16_t usb_pc_stall_window_ms = 600;   /* 真实时间窗(ms)，0 = 关闭 */
+volatile float    usb_pc_stall_eps_deg  = 0.30f;
+
+/* ★★★ 角度估计一致性护栏（安全关键，见 .h 说明）★★★ */
+volatile float    usb_pc_consist_tol_ticks = 50.0f;   /* 容差(刻)，50 刻 ≈ 4.4° */
+volatile uint32_t usb_pc_consist_err_cnt   = 0;
+volatile float    usb_pc_consist_err_ticks = 0.0f;
 
 volatile uint32_t usb_pc_write_cnt        = 0;
 volatile uint32_t usb_pc_write_reject_cnt = 0;
@@ -98,9 +107,13 @@ static uint8_t  s_txbuf[USB_PC_UP_FRAME_LEN];
 static uint32_t s_last_report_ms = 0;
 static uint32_t s_last_target_ms = 0;   /* 最后一次收到 0x61 的时刻（供超时判定） */
 
-/* 堵转检测状态（每路一份） */
+/* 堵转检测状态（每路一份）—— 按时间窗判定：
+ *   · 相对上次"确认有位移"的基准变化 > eps  ⇒ 更新基准、刷新时间戳、清"已卡住"
+ *   · 距上次确认位移超过 stall_window_ms    ⇒ 判定该路卡住（本帧跳过）
+ * 假堵转（慢速运动）会自己解除：它仍在动 → 位置变化 → 基准刷新 ✓ */
 static float    s_stall_ref_deg[6] = {0};   /* 上次"确认有位移"时的角度 */
-static uint8_t  s_stall_cnt[6]     = {0};   /* 连续"命令了却没动"的次数 */
+static uint32_t s_stall_ref_ms[6]  = {0};   /* 上次"确认有位移"的时刻 */
+static uint8_t  s_stalled[6]       = {0};   /* 1 = 判定卡住中 */
 
 /* ---------------- 校验：sum + 累加和(addr)，与车端逐字节一致 ----------------
  * sum 覆盖 [0 .. 4+dlen-1]（即 帧头..数据末字节），两个校验值都取低 8 位。 */
@@ -300,6 +313,42 @@ uint8_t usb_pc_arm_write_apply(void)
         return 0;
     }
 
+    /* ---------- 安全闸 ②.5：★★★ 角度估计一致性护栏（2026-09-27 新增，安全关键）★★★
+     * 校验 `raw == base_raw + dir×累积刻度`（mod 4096）。见 usb_pc_link.h 的详细说明。
+     * 简述：0x61 是绝对角协议，角度估计一旦被污染，PC 发来的绝对目标就会被理解成
+     *      大幅误动作（实测 J1 被污染 +1200 刻 ⇒ 发出 −117° 命令 ⇒ 冲出撞限位）。
+     * ⚠️ 必须在【任何写舵机之前】判定 —— 漏过之后每步 ±10° 地朝错误目标走，
+     *    2s 就能走 100°+，逐帧限幅完全挡不住。 */
+    {
+        float worst = 0.0f;
+
+        for (uint8_t i = 0; i < STS3215_NUM; i++)
+        {
+            const int16_t e = sts3215_consist_err(i);
+
+            if (e == (int16_t)0x7FFF)
+            {
+                usb_pc_write_stale_cnt++;      /* 最近一次读取不可信 */
+                return 0;
+            }
+
+            const float ae = (e >= 0) ? (float)e : -(float)e;
+            if (ae > worst)
+            {
+                worst = ae;
+            }
+        }
+
+        if (worst > usb_pc_consist_tol_ticks)
+        {
+            /* 拒绝驱动：角度估计不可信，绝不据此发运动命令。
+             * 计数器留给上位机/调试器看 —— 出现非 0 就说明"需要复位重建基准"。 */
+            usb_pc_consist_err_cnt++;
+            usb_pc_consist_err_ticks = worst;
+            return 0;
+        }
+    }
+
     /* ---------- 先读六路当前角，挑出"需要动作"的关节 ---------- */
     float   cur[STS3215_NUM];
     uint8_t cand[STS3215_NUM];
@@ -370,26 +419,30 @@ uint8_t usb_pc_arm_write_apply(void)
             d = -usb_pc_write_limit_deg;
         }
 
-        /* ★ 堵转保护：命令了却几乎没位移 ⇒ 判定顶限位 / 卡住 ⇒ 跳过该路。
-         * 判据用"本路角度相对上次'有位移'时的基准是否变化"，与命令是否发出无关，
-         * 所以正常运动（哪怕是慢速）不会误触发。 */
-        if (usb_pc_stall_limit > 0u)
+        /* ★ 堵转保护（2026-09-27 改为按真实时间窗判定，见文件头定义处的说明）：
+         * 上次"确认有位移"到现在超过 usb_pc_stall_window_ms 且位移仍小于 eps
+         * ⇒ 判定顶限位 / 卡住 ⇒ 本帧跳过该路（累加 stall_cnt 供观察）。
+         * 与"命令是否发出"无关，所以正常运动（哪怕是慢速）不会误触发；
+         * 而误判也是自解除的：只要它还在动，基准就会被刷新。 */
+        if (usb_pc_stall_window_ms > 0u)
         {
             const float moved = cur[i] - s_stall_ref_deg[i];
 
-            if (moved > usb_pc_stall_eps_deg || moved < -usb_pc_stall_eps_deg)
+            if ((moved > usb_pc_stall_eps_deg) || (moved < -usb_pc_stall_eps_deg))
             {
-                s_stall_ref_deg[i] = cur[i];   /* 确实在动：更新基准、清零计数 */
-                s_stall_cnt[i]     = 0u;
+                s_stall_ref_deg[i] = cur[i];      /* 确实在动：刷新基准与时间戳 */
+                s_stall_ref_ms[i]  = HAL_GetTick();
+                s_stalled[i]       = 0u;
             }
-            else if (s_stall_cnt[i] < 255u)
+            else if ((uint32_t)(HAL_GetTick() - s_stall_ref_ms[i]) >
+                     (uint32_t)usb_pc_stall_window_ms)
             {
-                s_stall_cnt[i]++;              /* 没动：累计 */
+                s_stalled[i] = 1u;
             }
 
-            if (s_stall_cnt[i] >= usb_pc_stall_limit)
+            if (s_stalled[i] != 0u)
             {
-                usb_pc_write_stall_cnt++;      /* 卡住了：本帧跳过这一路 */
+                usb_pc_write_stall_cnt++;         /* 卡住了：本帧跳过这一路 */
                 continue;
             }
         }
@@ -446,11 +499,12 @@ uint8_t usb_pc_arm_hold_now(void)
     usb_pc_target_flag = 0u;
     s_last_target_ms   = 0u;
 
-    /* 顺带把堵转计数清零：刹车后位置基准变了，旧的"没动"计数已无意义 */
+    /* 顺带把堵转判定清零：刹车后位置基准变了，旧的"没动"判定已无意义 */
     for (uint8_t i = 0; i < STS3215_NUM; i++)
     {
-        s_stall_cnt[i]     = 0u;
         s_stall_ref_deg[i] = usb_pc_target_deg[i];
+        s_stall_ref_ms[i]  = HAL_GetTick();
+        s_stalled[i]       = 0u;
     }
 
     usb_pc_hold_cnt++;

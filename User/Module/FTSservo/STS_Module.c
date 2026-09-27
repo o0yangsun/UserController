@@ -63,6 +63,8 @@ void STS3215_Init(STS3215_Encoder_t *encoder, int32_t base_encoder_value)
     encoder->base_ready = 0;   // 基准未经确认：头两次采样只同步、不累加
     encoder->fail_cnt = 0;
     encoder->ever_ok = 0;
+    encoder->base_raw = 0;
+    encoder->glitch_cnt = 0;
 }
 
 void sts3215_setup(void)
@@ -122,24 +124,28 @@ void sts3215_angle_get(uint8_t idx)
         return;
     }
 
-    /* ---------- ② 需要重置基准的两种情况 ---------- */
-    const int never_ok     = (enc->ever_ok == 0);                 /* 上电后还从未读到过 */
-    const int long_lost    = (enc->fail_cnt > STS3215_FAIL_TOL);  /* 连续失败较久，位移不可信 */
-
-    if (never_ok || long_lost)
+    /* ---------- ② 上电后首次成功读到：建立基准 ----------
+     * 此时 total_encoder_value 还是初值，故 base_raw 直接取当前 raw。
+     * 若不区分这一步：last_encoder_value 初值为 0 而 raw 已是 2048(归中后)，
+     * 直接差分会把整个归中偏移当成"转动量" → total_angle 凭空多 180°。 */
+    if (enc->ever_ok == 0)
     {
-        /* 上电首帧：last_encoder_value 还是初值 0 而 raw 已是 2048(归中后)，
-         *           直接差分会把整个归中偏移当成"转动量" → total_angle 凭空多 180°。
-         * 长时失联恢复：期间转了多少完全不可知，只能以当前位置为新起点。 */
-        enc->ever_ok          = 1u;
-        enc->fail_cnt         = 0u;
+        enc->ever_ok            = 1u;
+        enc->fail_cnt           = 0u;
         enc->last_encoder_value = enc->encoder_value;
-        enc->deadband_accum   = 0;
-        enc->base_ready       = 0;   // 重新进入"待确认"状态，需连续两次一致才认可
+        enc->base_raw           = enc->encoder_value;
+        enc->deadband_accum     = 0;
+        enc->base_ready         = 0;   /* 待确认：连续两次一致才认可 */
         return;
     }
 
-    /* ---------- ③ 短时失败后的恢复：不重置基准，继续正常差分 ---------- */
+    /* ★★★ 2026-09-27 关键修正：长时失联【不再重建基准 / 不再丢弃位移】★★★
+     * 原实现在 fail_cnt > STS3215_FAIL_TOL 时把当前刻度当新基准 ⇒ 那一段位移被
+     * 【永久丢弃】。高速运动期间读取会成串失败，这会让 total_encoder_value 系统性少算 ——
+     * 而 0x61 是【绝对角】协议：少算 = 上报角整体偏掉 = PC 发来的绝对目标被固件
+     * 理解成大幅误动作。实测：J1 累积量被污染 +1200 刻(+105°)，随即被命令 −117°
+     * 冲出去撞到机械限位（用户手动失能才停住）。
+     * 现在：失联只清计数，差分照常累加 —— raw 是绝对量，跨过失败窗口的差值仍然有效。 */
     enc->fail_cnt = 0u;
 
     /* 上电(或失联恢复)后的基准确认期：只同步、不累加。
@@ -162,6 +168,11 @@ void sts3215_angle_get(uint8_t idx)
             enc->base_ready = 0; // 发生跳变(典型为校准生效)：重新计数
         }
         enc->last_encoder_value = enc->encoder_value;
+        /* ★ 同步 base_raw 以【保持恒等式】raw == base_raw + dir*total。
+         *   本块退出时 base_ready 会变成 2，之后一致性护栏就要依赖这条恒等式；
+         *   校准生效造成的 raw 跳变是"坐标原点变了"，不是真实位移，
+         *   所以这里要把 base_raw 重新锚定，而不是把跳变量累加进 total。 */
+        enc->base_raw       = (int16_t)(enc->encoder_value - sts3215_dir[idx] * enc->total_encoder_value);
         enc->deadband_accum = 0;
         return;
     }
@@ -176,6 +187,15 @@ void sts3215_angle_get(uint8_t idx)
     {
         // 顺时针跳变（4095 → 0，实际是增加了一圈）
         diff += 4096; // 修正为正数（代表顺时针转）
+    }
+
+    /* 诊断：单次采样跳变过大（> STS3215_GLITCH_TOL 刻 ≈ 35°，对应 11667°/s）
+     * 几乎不可能是真实运动，多为总线错帧或机械滑脱。
+     * ★ 仍然按真实位移累加，只记计数 —— 宁可多算也不要少算：
+     *   少算会让"绝对角"整体偏掉，而 0x61 是绝对角协议，那等于放大成大幅误动作。 */
+    if (diff > STS3215_GLITCH_TOL || diff < -STS3215_GLITCH_TOL)
+    {
+        enc->glitch_cnt++;
     }
 
     // 方向修正：机械安装方向相反的通道在这里取反(配置见 sts3215_dir[])
@@ -343,6 +363,7 @@ int sts3215_set_torque(uint8_t idx, uint8_t enable)
 uint8_t sts3215_set_torque_all(uint8_t enable)
 {
     uint8_t ok = 0;
+    uint8_t failed_mask = 0;
 
     for (uint8_t i = 0; i < STS3215_NUM; i++)
     {
@@ -350,16 +371,50 @@ uint8_t sts3215_set_torque_all(uint8_t enable)
         {
             ok++;
         }
+        else
+        {
+            failed_mask |= (uint8_t)(1u << i);
+        }
         HAL_Delay(2);   /* 给舵机留一点处理时间，也避免总线上连发 */
+    }
+
+    /* ★★ 失能方向必须"尽力而为" —— 2026-09-27 实测教训 ★★
+     * 原来是"六路全部成功(ok==6)才翻转 sts3215_locked"，看似稳妥，实则危险：
+     *   运动过程中某一路写失败（总线忙/舵机响应慢）⇒ 状态一直保持 1（已使能）
+     *   ⇒ `usb_pc_arm_write_apply()` 继续放行 ⇒ PC 的 0x61 继续驱动机械臂，
+     *   **操作手按了 PA15 失能也停不下来**（用户实测反馈："好像没有用"）。
+     * 失能的语义是"放开"，必须无条件生效；失败的路再重试一轮，仅用于报告实际成功数。 */
+    if ((enable == 0u) && (failed_mask != 0u))
+    {
+        for (uint8_t i = 0; i < STS3215_NUM; i++)
+        {
+            if ((failed_mask & (uint8_t)(1u << i)) == 0u)
+            {
+                continue;
+            }
+            HAL_Delay(2);
+            if (sts3215_set_torque(i, 0u) == 0)
+            {
+                ok++;
+            }
+        }
     }
 
     sts3215_lock_ok_count = ok;
 
-    /* 只有六路全部成功才翻转逻辑状态：
-     * 少一路就不翻 → 再按一次会重试；而写同样的值本身幂等，故能自愈。 */
-    if (ok == STS3215_NUM)
+    if (enable)
     {
-        sts3215_locked = enable ? 1u : 0u;
+        /* 使能方向保持严格：只有六路全部应答才算"真的锁死了"。
+         * 少一路就不翻 → 再按一次即重试；而写同样的值幂等，故能自愈。 */
+        if (ok == STS3215_NUM)
+        {
+            sts3215_locked = 1u;
+        }
+    }
+    else
+    {
+        /* 失能方向：无论成功几路，都把状态置为"已放开" —— 用户/上位机的意图优先。 */
+        sts3215_locked = 0u;
     }
 
     return ok;
@@ -396,6 +451,33 @@ int sts3215_get_deg(uint8_t idx, float *out_deg)
 
     *out_deg = sts3215_encoder[idx].total_angle;
     return 0;
+}
+
+/* 一致性校验：encoder_value 与 (base_raw + dir*total) 的差（刻）。
+ * ★ 这是"绝对角估计是否可信"的唯一客观判据 —— 见 STS_Module.h 的说明，
+ *   以及 usb_pc_link.c 里"安全闸 ②.5"记录的那次 J1 冲出撞限位事故。 */
+int16_t sts3215_consist_err(uint8_t idx)
+{
+    if (idx >= STS3215_NUM)
+    {
+        return (int16_t)0x7FFF;
+    }
+
+    const STS3215_Encoder_t *e = &sts3215_encoder[idx];
+
+    if (e->is_received == 0)
+    {
+        return (int16_t)0x7FFF;      /* 最近一次读取不可信 */
+    }
+
+    int32_t exp = (int32_t)e->base_raw
+                + (int32_t)sts3215_dir[idx] * e->total_encoder_value;
+    exp &= 0xFFF;                    /* 12-bit 绕圈，归一到 0..4095 */
+
+    int16_t d = (int16_t)((int16_t)e->encoder_value - (int16_t)exp);
+    if (d > 2048)       { d = (int16_t)(d - 4096); }
+    else if (d < -2048) { d = (int16_t)(d + 4096); }
+    return d;
 }
 
 int sts3215_goto_deg(uint8_t idx, float target_deg, uint16_t speed, uint8_t acc)

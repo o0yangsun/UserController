@@ -65,6 +65,15 @@ extern uint8_t motor_ids[STS3215_NUM];
  * 现在改为：单次/短时失败【保留基准】，恢复后照常累加，把位移补回来；
  *   只有连续失败超过本阈值才判定"失联"，重置基准。 */
 #define STS3215_FAIL_TOL 3
+/* ⚠️ 2026-09-27 起 STS3215_FAIL_TOL 已不再用于"失联即重建基准"（见 sts3215_angle_get）。
+ *    保留宏以便回溯，当前无引用。 */
+
+/* 单次采样跳变告警阈值(刻)。1 刻 = 0.0879°。
+ * 采样周期约 3ms，`STS3215_GLITCH_TOL` 刻(默认 400 刻 ≈ 35°)对应 11667°/s ——
+ * 远超任何真实运动，故超过它几乎一定是总线错帧/机械滑脱，只记 glitch_cnt 供诊断，
+ * **不改变累加**（宁可多算，不要少算 —— 少算会让"绝对角"整体偏掉，进而让 PC 的
+ * 绝对目标命令变成大幅误动作）。 */
+#define STS3215_GLITCH_TOL 400
 
 // 定义STS3215编码器结构体（必须在函数声明之前）
 typedef struct
@@ -93,6 +102,16 @@ typedef struct
 
     uint8_t ever_ok;        // 是否成功读到过有效刻度（1=是）。用于区分"上电首帧"与
                             // "短时失败后的恢复帧"—— 前者必须重置基准，后者不能。
+
+    int16_t base_raw;       // ★ 基准建立时的原始刻度（2026-09-27 新增）。
+                            //   用于恒等式校验：encoder_value == base_raw + dir*total_encoder_value（mod 4096）。
+                            //   usb_pc_arm_write_apply() 用它做"一致性护栏"：一旦角度估计被污染，
+                            //   立刻拒绝驱动 —— 因为 0x61 是【绝对角】协议，估计一旦偏掉，
+                            //   发出去的就是大幅误动作（实测曾因此冲出 117° 撞限位）。
+                            //   任何"重建基准"的地方都必须按 base_raw = raw - dir*total 同步，
+                            //   保证恒等式恒成立。
+
+    uint32_t glitch_cnt;    // 单次采样跳变超过 STS3215_GLITCH_TOL 的次数（仅诊断）
 
 } STS3215_Encoder_t;
 
@@ -158,6 +177,18 @@ uint8_t sts3215_set_torque_all(uint8_t enable);
 
 /* 读某一路当前角度(主臂内部单位：度，相对上电基准)。返回 0=成功，-1=失败(下标越界/该路读数不可信)。 */
 int sts3215_get_deg(uint8_t idx, float *out_deg);
+
+/* ★ 一致性校验（2026-09-27 新增，安全关键）
+ * 返回 encoder_value 与 (base_raw + dir*total_encoder_value) 的差，单位"刻"，
+ * 绕圈归一化到 ±2048；返回 0x7FFF 表示最近一次读取不可信(is_received==0)。
+ *
+ * 用途：0x61 是【绝对角】协议，PC 发的是"读取时刻的角 + Δ"。正常情况下累积误差
+ *   在 `delta = target_enc − accumulated_enc` 里自动抵消，所以平时看不出问题；
+ *   但一旦角度估计被污染，绝对目标就会被固件理解成大幅误动作
+ *   （实测：J1 累积量被污染 +1200 刻 ⇒ 固件发出 −117° 命令 ⇒ 冲出撞限位）。
+ *   ⇒ usb_pc_arm_write_apply() 在任何写舵机之前必须先用本函数确认"估计可信"。
+ * 健康值：本项目实测 5/6 路残差仅 ±10 刻(≈0.9°，即死区累积器残留)。 */
+int16_t sts3215_consist_err(uint8_t idx);
 
 /* 把某一路移动到 target_deg（度，相对上电基准）。
  * speed/acc 透传给 WritePosEx（传 0,0 = 用舵机内部默认速度/加速度）。

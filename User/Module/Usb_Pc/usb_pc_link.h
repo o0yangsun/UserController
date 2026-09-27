@@ -150,10 +150,41 @@ extern volatile float    usb_pc_soft_min_deg[6];
 extern volatile float    usb_pc_soft_max_deg[6];
 
 /* 堵转判定：连续多少次"命令了却几乎没位移"就停止驱动该路。默认 20（约 0.6s）。
- * 0 = 关闭该保护。触发时该路会被跳过，并累加 usb_pc_write_stall_cnt。 */
+ * 0 = 关闭该保护。触发时该路会被跳过，并累加 usb_pc_write_stall_cnt。
+ * ⚠️ 2026-09-27 起【已废弃】：改为按真实时间窗判定（见 usb_pc_stall_window_ms）。
+ *    原因：这个"次数"是按 30ms/次估的，而实际调用周期是 3ms ⇒ 真实窗口只有 60ms。 */
 extern volatile uint8_t  usb_pc_stall_limit;
-/* 判定"几乎没位移"的阈值(度)。默认 0.15。 */
+/* 堵转判定窗口(ms)。默认 600。
+ * ★ 2026-09-27 重写：原来是"连续 N 次调用位移 < eps"，按"每 30ms 一次"估成 0.6s，
+ *   但该函数实际被主循环【每 3ms】调一次（algorithm_task_delta = 3）⇒ 真实窗口只有
+ *   20×3ms = 60ms ⇒ **任何低于 50°/s 的正常运动都被误判成"卡住"**，关节被周期性跳过，
+ *   表现为"速度上不去、一顿一顿"，还容易被误认为"舵机速度档不够"（本项目白跑了一轮扫描）。
+ *   ⇒ 现在按【真实时间窗】判定：某路在 usb_pc_stall_window_ms 内位移都没超过
+ *     usb_pc_stall_eps_deg 才判堵转。0 = 关闭该保护。 */
+extern volatile uint16_t usb_pc_stall_window_ms;
+/* 判定"几乎没位移"的阈值(度)。默认 0.3（读数分辨率为 1 刻 = 0.0879°，故 0.3° 足够灵敏）。 */
 extern volatile float    usb_pc_stall_eps_deg;
+
+/* ==================== ★★★ 角度估计一致性护栏（2026-09-27 新增，安全关键）★★★ ====================
+ *
+ * 为什么必须有它（实测失控事故）：
+ *   0x61 是【绝对角】协议，PC 发的是"它在读取时刻看到的角 + Δ"。正常情况下累积误差
+ *   会在 `delta = target_enc − accumulated_enc` 里自动抵消，所以平时看不出问题。
+ *   但一旦角度估计被污染（读取成串失败丢位移 / 过零修正误判 / 撞限位后机械滑脱），
+ *   PC 仍在发同一帧里的绝对目标 ⇒ 固件算出的 delta 会突然变成几十上百度的【合法】命令
+ *   （raw 仍在 0..4095、也不超半圈，所有量程检查全部通过）⇒ 机械臂朝错误方向猛冲。
+ *   实测：J1 累积量被污染 +1200 刻(+105°) ⇒ 固件发出 −117° 命令 ⇒ 冲出撞到机械限位，
+ *         用户手动失能才停住。
+ *
+ * 护栏：动手前校验 `raw == base_raw + dir×累积刻度`（mod 4096）。
+ *   健康值：本项目实测 5/6 路残差仅 ±10 刻(≈0.9°，死区累积器残留)；
+ *   污染量级是上百刻 ⇒ 50 刻的容差既能通过健康路、又能拦下污染路。
+ * ⚠️ 必须在【任何写舵机之前】判定：一旦漏过，后面每步 ±10° 地朝错误目标走，
+ *   2 秒就能走出 100°+，逐帧限幅根本挡不住。
+ */
+extern volatile float    usb_pc_consist_tol_ticks;   /* 容差(刻)，默认 50 */
+extern volatile uint32_t usb_pc_consist_err_cnt;     /* 因一致性不合被拒绝驱动的帧数 */
+extern volatile float    usb_pc_consist_err_ticks;   /* 最近一次的误差量(刻)，供诊断 */
 
 /* ---- 调试计数（供 OctoLink / GDB 观察） ---- */
 extern volatile uint32_t usb_pc_write_cnt;         /* 实际执行移动的关节次数 */
