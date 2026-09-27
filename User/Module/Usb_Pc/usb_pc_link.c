@@ -46,17 +46,33 @@ volatile uint32_t usb_pc_rx_bad_cnt  = 0;
 volatile uint32_t usb_pc_last_id     = 0;
 volatile uint32_t usb_pc_tick        = 0;
 
-/* ---------------- 0x61 写位置：安全闸（默认值刻意保守，见 .h 说明） ---------------- */
-volatile uint8_t  usb_pc_write_max_joints = 1;      /* 单帧只允许 1 路变化 */
+/* ---------------- 0x61 写位置：安全闸 ---------------- */
+/* max_joints 默认 1 的教训见 .h 说明：真实系统里"多路同时有小偏差"是常态，
+ * 限制路数会导致整帧被拒、命令完全没反应（实机实测 reject_cnt 疯涨 write_cnt 恒 0）。 */
+volatile uint8_t  usb_pc_write_max_joints = 6;      /* 默认全部允许，安全靠限幅+超时+软限位 */
 volatile float    usb_pc_write_limit_deg  = 10.0f;  /* 单次限幅 10° */
 volatile uint16_t usb_pc_write_speed      = 0;      /* 0 = 舵机内部默认速度 */
 volatile uint8_t  usb_pc_write_acc        = 0;      /* 0 = 舵机内部默认加速度 */
 volatile uint16_t usb_pc_write_timeout_ms = 200;    /* 命令有效期 200ms */
 volatile float    usb_pc_write_eps_deg    = 0.5f;   /* 小于 0.5° 视为已到位 */
 
+/* 逐路软限位。★ 必须按实机机械行程填写。
+ * 已知：底座(J1，索引 0) 的机械行程为 ±90°（2026-09-27 用户确认），
+ *       故默认给它留 5° 余量、限到 ±85 —— 这样即使 PC 发来超程目标，
+ *       也只走到 85° 就停，不会顶在限位上满力堵转。
+ *       其余关节行程未知，暂用 ±170（几乎不限制），后续按实机填写。
+ * 两者都是 volatile，调试器可在线改，不必重烧。 */
+volatile float    usb_pc_soft_min_deg[6] = {-85.0f, -170.0f, -170.0f, -170.0f, -170.0f, -170.0f};
+volatile float    usb_pc_soft_max_deg[6] = { 85.0f,  170.0f,  170.0f,  170.0f,  170.0f,  170.0f};
+
+/* 堵转保护：连续 N 次"命令了却几乎没位移"就停止驱动该路（默认 20 次 ≈ 0.6s） */
+volatile uint8_t  usb_pc_stall_limit    = 20;
+volatile float    usb_pc_stall_eps_deg  = 0.15f;
+
 volatile uint32_t usb_pc_write_cnt        = 0;
 volatile uint32_t usb_pc_write_reject_cnt = 0;
 volatile uint32_t usb_pc_write_stale_cnt  = 0;
+volatile uint32_t usb_pc_write_stall_cnt  = 0;
 volatile float    usb_pc_last_write_deg[6] = {0};
 volatile uint8_t  usb_pc_last_write_idx   = 0;
 
@@ -64,6 +80,10 @@ volatile uint8_t  usb_pc_last_write_idx   = 0;
 static uint8_t  s_txbuf[USB_PC_UP_FRAME_LEN];
 static uint32_t s_last_report_ms = 0;
 static uint32_t s_last_target_ms = 0;   /* 最后一次收到 0x61 的时刻（供超时判定） */
+
+/* 堵转检测状态（每路一份） */
+static float    s_stall_ref_deg[6] = {0};   /* 上次"确认有位移"时的角度 */
+static uint8_t  s_stall_cnt[6]     = {0};   /* 连续"命令了却没动"的次数 */
 
 /* ---------------- 校验：sum + 累加和(addr)，与车端逐字节一致 ----------------
  * sum 覆盖 [0 .. 4+dlen-1]（即 帧头..数据末字节），两个校验值都取低 8 位。 */
@@ -203,6 +223,20 @@ void usb_pc_service(void)
     }
 }
 
+/* 软限位钳位：把目标角限制在该路允许的机械行程内（防止顶着限位堵转） */
+static float clamp_soft(uint8_t i, float deg)
+{
+    if (deg > usb_pc_soft_max_deg[i])
+    {
+        return usb_pc_soft_max_deg[i];
+    }
+    if (deg < usb_pc_soft_min_deg[i])
+    {
+        return usb_pc_soft_min_deg[i];
+    }
+    return deg;
+}
+
 /* ---------------- 0x61 写位置：应用 PC 下发的目标角 ---------------- */
 uint8_t usb_pc_arm_write_apply(void)
 {
@@ -247,7 +281,11 @@ uint8_t usb_pc_arm_write_apply(void)
             return 0;
         }
 
-        const float d = usb_pc_target_deg[i] - cur[i];
+        /* ★ 软限位：先把目标钳到该路允许范围内，再判"是否需要动作"。
+         *   这样即使 PC 发来超程目标，最多走到边界 —— 不会一直顶着机械限位出力
+         *   （2026-09-27 实测：撞限位后机械滑脱、角度猛跳 113°）。 */
+        const float d = clamp_soft(i, usb_pc_target_deg[i]) - cur[i];
+
         if (d > usb_pc_write_eps_deg || d < -usb_pc_write_eps_deg)
         {
             cand[n++] = i;
@@ -261,22 +299,22 @@ uint8_t usb_pc_arm_write_apply(void)
         return 0;
     }
 
-    /* ---------- 安全闸 ③：单帧只允许 N 路变化（默认 1） ----------
-     * 一帧里有多路同时超出容差时整帧拒绝，而不是"只做第一路"——
-     * 拒绝比分批偷偷动更可预期，也让 PC 侧立刻能从 reject_cnt 发现动作超范围。 */
+    /* ---------- 安全闸 ③：单帧允许变化的路数上限 ----------
+     * 默认 6（即不限制）—— 安全由限幅/超时/软限位保证，而不是靠限制路数。
+     * 想做单关节测试时把这个值临时改成 1（volatile），PC 侧其余关节填当前值。 */
     if (n > usb_pc_write_max_joints)
     {
         usb_pc_write_reject_cnt++;
         return 0;
     }
 
-    /* ---------- 安全闸 ④：逐路相对当前角限幅后执行 ---------- */
+    /* ---------- 安全闸 ④：逐路限幅 + 堵转保护，然后执行 ---------- */
     uint8_t done = 0;
 
     for (uint8_t k = 0; k < n; k++)
     {
         const uint8_t i = cand[k];
-        float d = usb_pc_target_deg[i] - cur[i];
+        float d = clamp_soft(i, usb_pc_target_deg[i]) - cur[i];
 
         /* 超限不是拒绝，而是"钳到边界缓慢逼近"：
          * 这样即使 PC 一次给了大目标，主臂也会按 10°/次 的节奏走过去，
@@ -288,6 +326,30 @@ uint8_t usb_pc_arm_write_apply(void)
         else if (d < -usb_pc_write_limit_deg)
         {
             d = -usb_pc_write_limit_deg;
+        }
+
+        /* ★ 堵转保护：命令了却几乎没位移 ⇒ 判定顶限位 / 卡住 ⇒ 跳过该路。
+         * 判据用"本路角度相对上次'有位移'时的基准是否变化"，与命令是否发出无关，
+         * 所以正常运动（哪怕是慢速）不会误触发。 */
+        if (usb_pc_stall_limit > 0u)
+        {
+            const float moved = cur[i] - s_stall_ref_deg[i];
+
+            if (moved > usb_pc_stall_eps_deg || moved < -usb_pc_stall_eps_deg)
+            {
+                s_stall_ref_deg[i] = cur[i];   /* 确实在动：更新基准、清零计数 */
+                s_stall_cnt[i]     = 0u;
+            }
+            else if (s_stall_cnt[i] < 255u)
+            {
+                s_stall_cnt[i]++;              /* 没动：累计 */
+            }
+
+            if (s_stall_cnt[i] >= usb_pc_stall_limit)
+            {
+                usb_pc_write_stall_cnt++;      /* 卡住了：本帧跳过这一路 */
+                continue;
+            }
         }
 
         const float tgt = cur[i] + d;

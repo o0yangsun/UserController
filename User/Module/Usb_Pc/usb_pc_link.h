@@ -78,9 +78,19 @@ void usb_pc_service(void);
  * 所以默认值刻意压到最小（单帧只动 1 路、单次限幅 10°），先保证安全。
  * ========================================================================================== */
 
-/* 单帧最多允许"发生变化"的关节数。默认 1。
- * 若一帧里需要动的关节数超过本值 → 整帧拒绝执行（记入 usb_pc_write_reject_cnt）。
- * 想一次跟踪整条臂时，把它放宽到 6。 */
+/* 单帧最多允许"发生变化"的关节数。
+ *
+ * ★ 2026-09-27 实机教训：默认值曾设为 1，结果【几乎完全无法使用】——
+ *   因为 PC 发来的目标里，只要任意一路与固件端"当前角"差超过 eps(0.5°)，
+ *   它也算"需要动作"。而真实系统里这种小偏差几乎必然存在
+ *   （重力微动、机械耦合、USB 往返 30ms 期间的位置变化），
+ *   于是经常出现 2 路同时偏离 → 整帧被拒 → 表现为"命令完全没反应"。
+ *   实测计数器：reject_cnt 疯涨而 write_cnt 恒为 0。
+ *
+ * ⇒ 默认改为 6（全部允许）：安全由"每路 10° 限幅 + 200ms 超时 + 逐路软限位"保证，
+ *   而不是靠"限制路数"。
+ * ⇒ 想做"单关节单独测试"时，把这个值临时改成 1（volatile，调试器可在线改），
+ *   并让 PC 侧把其余关节的目标填成【各自当前值】。 */
 extern volatile uint8_t  usb_pc_write_max_joints;
 
 /* 每路相对【当前角】的限幅(度)。默认 10.0。
@@ -102,10 +112,30 @@ extern volatile uint16_t usb_pc_write_timeout_ms;
  * 角度差小于它的关节不产生任何总线事务，所以 PC 持续重发同一目标也无额外开销。 */
 extern volatile float    usb_pc_write_eps_deg;
 
+/* ============================ 逐路软限位 ============================
+ * 背景：本机底座的机械行程只有 ±90°（其余关节行程不同）。若 PC 发来超程目标，
+ *       舵机会一直顶在机械限位上满力堵转 —— 2026-09-27 实测因此出现过
+ *       "撞限位后机械滑脱、角度猛跳 113°"。
+ * 做法：把目标角先钳到这组边界内，再参与后面的限幅与执行。
+ *       ⇒ 即使 PC 发来离谱目标，最多走到边界，不会顶着限位持续出力。
+ * 用法：按实际机械行程逐路设置。例如底座 ±90° 行程，建议设 ±80（留 10° 余量）：
+ *           usb_pc_soft_min_deg[0] = -80.0f;  usb_pc_soft_max_deg[0] = 80.0f;
+ *       两者都是 volatile，调试器可在线改，不必重烧。
+ * 默认 ±170（几乎不限制）—— 因为各关节行程不同，必须由使用者按实机填写。 */
+extern volatile float    usb_pc_soft_min_deg[6];
+extern volatile float    usb_pc_soft_max_deg[6];
+
+/* 堵转判定：连续多少次"命令了却几乎没位移"就停止驱动该路。默认 20（约 0.6s）。
+ * 0 = 关闭该保护。触发时该路会被跳过，并累加 usb_pc_write_stall_cnt。 */
+extern volatile uint8_t  usb_pc_stall_limit;
+/* 判定"几乎没位移"的阈值(度)。默认 0.15。 */
+extern volatile float    usb_pc_stall_eps_deg;
+
 /* ---- 调试计数（供 OctoLink / GDB 观察） ---- */
 extern volatile uint32_t usb_pc_write_cnt;         /* 实际执行移动的关节次数 */
 extern volatile uint32_t usb_pc_write_reject_cnt;  /* 因超过单帧路数闸被拒的帧数 */
 extern volatile uint32_t usb_pc_write_stale_cnt;   /* 因未使能 / 标志为0 / 超时而未执行的次数 */
+extern volatile uint32_t usb_pc_write_stall_cnt;   /* 因堵转保护被跳过的次数 */
 extern volatile float    usb_pc_last_write_deg[6]; /* 最近一次实际写入的目标角(度) */
 extern volatile uint8_t  usb_pc_last_write_idx;    /* 最近写入的通道号+1（0=从未写过） */
 
