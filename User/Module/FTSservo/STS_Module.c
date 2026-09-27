@@ -61,6 +61,8 @@ void STS3215_Init(STS3215_Encoder_t *encoder, int32_t base_encoder_value)
     encoder->is_received = 0;
     encoder->deadband_accum = 0;
     encoder->base_ready = 0;   // 基准未经确认：头两次采样只同步、不累加
+    encoder->fail_cnt = 0;
+    encoder->ever_ok = 0;
 }
 
 void sts3215_setup(void)
@@ -107,32 +109,46 @@ void sts3215_angle_get(uint8_t idx)
 {
     STS3215_Encoder_t *enc = &sts3215_encoder[idx];
 
-    // 读失败(舵机未接/握手失败/通信中断)时：
-    // 不执行差分累积与 last 更新，保证 total_encoder_value / total_angle 不被垃圾增量污染
-    const int was_received = enc->is_received; // 记录本次读取【之前】的状态
+    /* ---------- ① 读取失败 ----------
+     * ★ 2026-09-27 修正（原来这里会丢位移）：
+     *   旧实现是"一次失败 → 恢复后把当前刻度当新基准" ⇒ 那一小段位移被【永久丢弃】。
+     *   而舵机快速运动时 ReadPos 很容易失败（总线繁忙 + 运动中响应慢），
+     *   实测导致"物理已到位、读数却偏低"（J1 目标 3° 只报 1.667°，用户手感是到位了）。
+     * 现在：只累加失败计数、【不动任何基准状态】——
+     *   恢复后照常做差分，那段位移就能补回来。 */
     if (sts3215_encoder_get(idx) != 0)
-        return;
-
-    // 首次成功读到该路(含上电后的第一帧、以及失联后恢复的第一帧)：
-    // 只把当前刻度同步为差分的基准，不产生增量。
-    // 必要性：若 last_encoder_value 仍是初值 0 而 raw 已是 2048(归中后)，
-    //         会把整个归中偏移当成"转动量"累加进去 → total_angle 凭空多 180°。
-    //         之前只靠"校准后补读一次"来初始化 last，一旦那次读失败就会出现该问题。
-    if (!was_received)
     {
-        enc->last_encoder_value = enc->encoder_value;
-        enc->deadband_accum = 0; // 基准重建：丢弃此前积攒的差值(失联期间的位移不可信)
-        enc->base_ready = 0;     // 重新进入"待确认"状态，需连续两次一致才认可
+        enc->fail_cnt++;   // 饱和于 255（uint8_t 自动回绕到 0 也有兜底：>TOL 即判失联）
         return;
     }
 
-    // 上电(或失联恢复)后的基准确认期：只同步、不累加。
-    // —— 消除"中位校准生效时机 vs 固件首次读取"的时序竞争：
-    //    校准一生效 raw 会一次性跳到 2048(幅度可达 ±2048 刻度 = ±180°)，
-    //    若基准是用校准前的 raw 建立的，这一跳就会被当成真实转动累加进去，
-    //    表现为"上电后某几路一上来就是 ±180°"(已在实机上复现)。
-    // 判据：相邻两次采样差值 ≤ STS3215_BASE_TOL 才连续计数，累计 2 次即认可基准；
-    //       期间任何一次跳变都清零计数并只做同步 —— 跳变不会被累加，慢速小位移(<容差)也几乎无损。
+    /* ---------- ② 需要重置基准的两种情况 ---------- */
+    const int never_ok     = (enc->ever_ok == 0);                 /* 上电后还从未读到过 */
+    const int long_lost    = (enc->fail_cnt > STS3215_FAIL_TOL);  /* 连续失败较久，位移不可信 */
+
+    if (never_ok || long_lost)
+    {
+        /* 上电首帧：last_encoder_value 还是初值 0 而 raw 已是 2048(归中后)，
+         *           直接差分会把整个归中偏移当成"转动量" → total_angle 凭空多 180°。
+         * 长时失联恢复：期间转了多少完全不可知，只能以当前位置为新起点。 */
+        enc->ever_ok          = 1u;
+        enc->fail_cnt         = 0u;
+        enc->last_encoder_value = enc->encoder_value;
+        enc->deadband_accum   = 0;
+        enc->base_ready       = 0;   // 重新进入"待确认"状态，需连续两次一致才认可
+        return;
+    }
+
+    /* ---------- ③ 短时失败后的恢复：不重置基准，继续正常差分 ---------- */
+    enc->fail_cnt = 0u;
+
+    /* 上电(或失联恢复)后的基准确认期：只同步、不累加。
+     * —— 消除"中位校准生效时机 vs 固件首次读取"的时序竞争：
+     *    校准一生效 raw 会一次性跳到 2048(幅度可达 ±2048 刻度 = ±180°)，
+     *    若基准是用校准前的 raw 建立的，这一跳就会被当成真实转动累加进去，
+     *    表现为"上电后某几路一上来就是 ±180°"(已在实机上复现)。
+     * 判据：相邻两次采样差值 ≤ STS3215_BASE_TOL 才连续计数，累计 2 次即认可基准；
+     *       期间任何一次跳变都清零计数并只做同步 —— 跳变不会被累加，慢速小位移(<容差)也几乎无损。 */
     if (enc->base_ready < 2)
     {
         int16_t d = (int16_t)(enc->encoder_value - (int16_t)enc->last_encoder_value);

@@ -54,7 +54,13 @@ volatile float    usb_pc_write_limit_deg  = 10.0f;  /* 单次限幅 10° */
 volatile uint16_t usb_pc_write_speed      = 0;      /* 0 = 舵机内部默认速度 */
 volatile uint8_t  usb_pc_write_acc        = 0;      /* 0 = 舵机内部默认加速度 */
 volatile uint16_t usb_pc_write_timeout_ms = 200;    /* 命令有效期 200ms */
-volatile float    usb_pc_write_eps_deg    = 0.5f;   /* 小于 0.5° 视为已到位 */
+/* "已到位"阈值。
+ * ★ 2026-09-27 实测：原为 0.5°，太小 —— STS3215 内部有位置死区（约 15~20 刻度
+ *   ≈ 1.3~1.8°），当"目标与当前值"的差落到死区内时舵机不再动作，
+ *   而固件仍判"未到位"继续发命令 ⇒ 每帧白跑一次总线、且表现为"命令了却不动"。
+ *   实测 J1 目标 3° 时停在离目标 1.33° 处（正好落在死区边界）。
+ *   ⇒ 调到 1.5°，让固件在死区范围内就认可"已到位"。 */
+volatile float    usb_pc_write_eps_deg    = 1.5f;
 
 /* 逐路软限位。★ 必须按实机机械行程填写。
  * 已知：底座(J1，索引 0) 的机械行程为 ±90°（2026-09-27 用户确认），
@@ -281,12 +287,19 @@ uint8_t usb_pc_arm_write_apply(void)
             return 0;
         }
 
-        /* ★ 软限位：先把目标钳到该路允许范围内，再判"是否需要动作"。
-         *   这样即使 PC 发来超程目标，最多走到边界 —— 不会一直顶着机械限位出力
-         *   （2026-09-27 实测：撞限位后机械滑脱、角度猛跳 113°）。 */
-        const float d = clamp_soft(i, usb_pc_target_deg[i]) - cur[i];
+        /* ★★ 用【PC 原始目标】判定"是否需要动作"，而不是钳位后的目标。
+         * 理由（2026-09-27 实测事故）：若某路当前读数已经"超程"
+         *   （例如 J6 因绕圈累积报成 175.9°，而软限位上限是 170°），
+         *   那么"钳位后目标(170) 与 当前值(175.9)"必然有偏差
+         *   ⇒ 每帧都产生一个"把它拉回 170°"的命令
+         *   ⇒ 而这个命令在 raw 空间里可能对应错误方向
+         *   ⇒ 实测把 J6 一路驱动到撞底板（真机械损伤）。
+         * 现在：只有 PC 真的要求该路变化时才动；PC 目标本身超程则钳位后再走。
+         *    - PC 目标 == 当前值            -> 不候选 -> 不动（不再"主动追赶"）
+         *    - PC 目标超程(如 200°>170°)    -> 候选 -> 钳位到 170° 再执行 */
+        const float raw_d = usb_pc_target_deg[i] - cur[i];
 
-        if (d > usb_pc_write_eps_deg || d < -usb_pc_write_eps_deg)
+        if (raw_d > usb_pc_write_eps_deg || raw_d < -usb_pc_write_eps_deg)
         {
             cand[n++] = i;
         }
