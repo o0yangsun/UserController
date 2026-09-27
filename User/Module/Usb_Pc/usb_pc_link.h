@@ -11,6 +11,16 @@
  *   0x60  主臂 → PC   6 关节角(弧度×10000, int32 小端) + 使能状态(int8)   数据长 25，帧长 31
  *   0x61  PC → 主臂   6 个目标关节角(弧度×10000) + 生效标志(int8)          数据长 25
  *   0x62  PC → 主臂   使能/失能(int8)                                      数据长 1
+ *   0x63  PC → 主臂   立即原位保持 HOLD(int8，值忽略)                       数据长 1
+ *
+ * ★ 为什么需要 0x63（2026-09-27 实测教训）：
+ *   位置伺服是"持有目标"模型 —— **不再写新目标，它仍会继续奔向最后写入的 goal**，
+ *   没有任何"取消"手段（`usb_pc_write_timeout_ms` 只是不再写新目标，不是刹车）。
+ *   实测：脚本已完全停发 3s，J2 仍走了 9.49°、J3 走了 8.70°（J3 是往上走，排除重力）。
+ *   而想用"目标=当前位置"来刹车也写不进去 —— 普通 0x61 会因"差值 < eps"判定
+ *   "已到位"而不产生任何总线事务。
+ *   ⇒ 所以专门留这条命令：**绕过 eps 判定，强制把六路 goal 写成当前位置**，
+ *     并让残留目标失效。这才是可靠的"停"。
  *
  * ★ 单位约定：PC 侧一律用【弧度】；主臂内部一律用【度】。
  *   所以 上行打包时 度→弧度，下行解析时 弧度→度，转换都在本模块内部完成。
@@ -30,12 +40,14 @@
 #define USB_PC_ID_ARM_UP            0x60  /* 主臂 → PC：关节角 + 使能状态 */
 #define USB_PC_ID_ARM_TARGET        0x61  /* PC → 主臂：目标关节角 */
 #define USB_PC_ID_ARM_ENABLE        0x62  /* PC → 主臂：使能 / 失能 */
+#define USB_PC_ID_ARM_HOLD          0x63  /* PC → 主臂：立即原位保持（真正的"停"） */
 
 /* ---- 数据长度 / 帧长 ---- */
 #define USB_PC_UP_DATA_LEN          25
 #define USB_PC_UP_FRAME_LEN         (4 + USB_PC_UP_DATA_LEN + 2)   /* = 31 */
 #define USB_PC_DOWN_TARGET_LEN      25
 #define USB_PC_DOWN_ENABLE_LEN      1
+#define USB_PC_DOWN_HOLD_LEN        1
 
 /* ---- 角度单位换算 ---- */
 #define USB_PC_DEG2RAD              0.01745329252f   /* π/180 */
@@ -43,14 +55,19 @@
 #define USB_PC_SCALE                10000.0f         /* 弧度 × 10000 定点 */
 
 /* ============ 上报周期 ============ */
-/* 单位 ms。建议 30~50（30~33 Hz，与 0x0302 同级，见移植文档 §4.1）。
- * 用 volatile 修饰，可直接用调试器在线改写测试，无需重新烧录。 */
+/* 单位 ms。
+ * ★ 2026-09-27：30(≈33Hz) → **16(名义 62.5Hz)**。
+ *   原因：PC 侧感受到的"读数滞后"主要来自本周期的量化（均值 T/2、最坏 T）。
+ *   实测 55.8~56.3 fps（不是 62.5）—— 因为上报判定发生在 ~3ms 的 AlgorithmTask 循环里，
+ *   16ms 实际落到约 18ms ⇒ 55.6fps。想更贴近 60Hz 可设 14(≈66fps)。
+ *   带宽：31B × 62.5 ≈ 1.94 kB/s，USB FS CDC 无压力。 */
 extern volatile uint16_t usb_pc_report_ms;
 
 /* ============ PC 下发的数据（均已换算成【度】，与主臂内部单位一致） ============ */
 extern volatile float    usb_pc_target_deg[6];   /* 0x61 解析结果 */
 extern volatile uint8_t  usb_pc_target_flag;     /* 0x61 的"立即生效"标志 */
 extern volatile int8_t   usb_pc_enable_req;      /* 0x62 请求：-1=无 / 0=失能 / 1=使能。使用方处理完应置回 -1 */
+extern volatile uint8_t  usb_pc_hold_req;        /* 0x63 请求：1=待执行"立即原位保持"，执行完自动清 0 */
 
 /* ============ 调试计数（供 OctoLink / GDB 观察） ============ */
 extern volatile uint32_t usb_pc_tx_cnt;          /* 成功发出的 0x60 帧数 */
@@ -97,8 +114,15 @@ extern volatile uint8_t  usb_pc_write_max_joints;
  * 目标与当前角之差超过它就被钳到 ±本值后执行（不是拒绝，是缓慢逼近）。 */
 extern volatile float    usb_pc_write_limit_deg;
 
-/* 透传给 WritePosEx 的速度/加速度（0,0 = 用舵机内部默认值）。
- * 想让它动得更慢/更柔，把速度调小（例如 100~300）。 */
+/* 透传给 WritePosEx 的速度/加速度。
+ * ★ 2026-09-27 实测标定（仓库里没有单位文档，用"设定值 40 + 实测到位速度"反推）：
+ *      设定 40 → 实测 2.5~3.1°/s ⇒ **单位 ≈ 0.088 °/s per unit**
+ *      （即 steps/s 家族：1 步 = 1/4096 圈，0.0879°/步）
+ *   ⇒ 角速度(°/s) ≈ 设定值 × 0.088 ；设定值 ≈ 目标角速度(°/s) × 11.4
+ *   ⇒ 常用参考：50° 的行程想 4s 走完 → 12.5°/s → **≈170**
+ *               想 8s 走完 → 6.25°/s → ≈70
+ * 默认取 170（中速，约 12°/s）。0 = 舵机内部默认（最快，不建议）。
+ * ⚠️ 只影响 0x61（PC 驱动主臂）这条通路，**不影响 0x0302 遥操作**。 */
 extern volatile uint16_t usb_pc_write_speed;
 extern volatile uint8_t  usb_pc_write_acc;
 
@@ -136,6 +160,7 @@ extern volatile uint32_t usb_pc_write_cnt;         /* 实际执行移动的关�
 extern volatile uint32_t usb_pc_write_reject_cnt;  /* 因超过单帧路数闸被拒的帧数 */
 extern volatile uint32_t usb_pc_write_stale_cnt;   /* 因未使能 / 标志为0 / 超时而未执行的次数 */
 extern volatile uint32_t usb_pc_write_stall_cnt;   /* 因堵转保护被跳过的次数 */
+extern volatile uint32_t usb_pc_hold_cnt;          /* 执行过多少次"立即原位保持" */
 extern volatile float    usb_pc_last_write_deg[6]; /* 最近一次实际写入的目标角(度) */
 extern volatile uint8_t  usb_pc_last_write_idx;    /* 最近写入的通道号+1（0=从未写过） */
 
@@ -150,5 +175,16 @@ extern volatile uint8_t  usb_pc_last_write_idx;    /* 最近写入的通道号+1
  * @return 本次实际执行移动的关节数（0 = 未执行任何动作）
  */
 uint8_t usb_pc_arm_write_apply(void);
+
+/**
+ * @brief  0x63：立即原位保持 —— 让机械臂**真正停住**。
+ * @note   为什么普通 0x61 做不到：位置伺服"持有目标"，停发新目标它仍会奔向旧 goal；
+ *         而写"目标=当前位置"又会被 eps 判定为"已到位"、不产生任何总线事务。
+ *         本函数**绕过 eps 判定**，对六路逐个 `goal = 当前角`，并让残留目标失效
+ *         （同时把 usb_pc_target_deg[] 同步成当前角、清掉 target_flag）。
+ *         不需要已使能 —— 自由态下调用是无害的（舵机不输出扭矩，只是写入 goal）。
+ * @return 实际成功写入的路数（0~6）。读不到某路当前位置时该路跳过，不会盲写。
+ */
+uint8_t usb_pc_arm_hold_now(void);
 
 #endif /* USB_PC_LINK_H */

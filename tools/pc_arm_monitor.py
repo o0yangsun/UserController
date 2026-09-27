@@ -20,6 +20,7 @@ pc_arm_monitor.py —— PC 侧：读主臂板（0x60 帧）/ 下发命令（0x6
     python pc_arm_monitor.py COM7 --enable 1     # 发 0x62 使能（0=失能），发完退出
     python pc_arm_monitor.py COM7 --target 0.1 0.2 0.3 0.4 0.5 0.6   # 发 0x61（弧度），发完退出
     python pc_arm_monitor.py COM7 --target-deg 10 0 0 0 0 0 --hold 3  # 发 0x61（度），持续 3 秒
+    python pc_arm_monitor.py COM7 --hold-now     # 发 0x63 立即原位保持（真正的"停"）
 
 依赖：pyserial      安装：pip install pyserial
 """
@@ -41,6 +42,7 @@ ADDR = 0x05
 ID_UP = 0x60
 ID_TARGET = 0x61
 ID_ENABLE = 0x62
+ID_HOLD = 0x63        # 立即原位保持（真正的"停"，绕过 eps 判定强制写 goal=当前位置）
 SCALE = 10000.0
 
 
@@ -59,6 +61,12 @@ def build_frame(nid: int, payload: bytes) -> bytes:
 
 def make_enable_frame(enable: int) -> bytes:
     return build_frame(ID_ENABLE, bytes([1 if enable else 0]))
+
+
+def make_hold_frame() -> bytes:
+    """0x63 立即原位保持：把六路 goal 强制写成当前位置 ⇒ 真正的"停"。
+    普通 0x61 做不到（目标=当前位置会被判"已到位"、不产生总线事务）。"""
+    return build_frame(ID_HOLD, bytes([1]))
 
 
 def make_target_frame(rad_list, flag: int = 1) -> bytes:
@@ -131,6 +139,10 @@ def main():
                          "且 200ms 无新命令就停止(超时保护)，"
                          "所以要把目标走完【必须持续发】。")
     ap.add_argument("--rate", type=int, default=30, help="--hold 模式下的发送周期(ms)，默认 30")
+    ap.add_argument("--hold-now", action="store_true",
+                    help="发 0x63：立即原位保持 —— 强制把六路 goal 写成当前位置，"
+                         "机械臂真正停住。★ 普通的「停发 0x61」停不住：舵机会继续奔向"
+                         "最后写入的目标（实测停发后仍各走了 9°/8.7°）")
     args = ap.parse_args()
 
     if args.target_deg:
@@ -150,6 +162,27 @@ def main():
         return 1
 
     # ---- 一次性命令模式 ----
+    if args.hold_now:
+        ser.write(make_hold_frame())
+        ser.flush()
+        print("已发送 0x63：立即原位保持（六路 goal = 当前位置）")
+        # 读一帧回来确认姿态（顺带证明链路还活着）
+        p = StreamParser()
+        t0 = time.time()
+        last = None
+        while time.time() - t0 < 1.0:
+            d = ser.read(1024)
+            if d:
+                for nid, pl in p.feed(d):
+                    if nid == ID_UP and len(pl) >= 24:
+                        last = decode_0x60(pl)
+        if last:
+            rad, en = last
+            print("  当前角度(度): %s" % "  ".join("%8.3f" % (v * 57.29577951) for v in rad))
+            print("  使能位 = %d" % en)
+        ser.close()
+        return 0
+
     if args.enable is not None:
         ser.write(make_enable_frame(args.enable))
         ser.flush()

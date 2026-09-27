@@ -33,11 +33,19 @@ extern uint32_t       USB_Received_Len;
 extern volatile uint8_t USB_Data_Ready_Flag;
 
 /* ---------------- 对外可见的配置与状态 ---------------- */
-volatile uint16_t usb_pc_report_ms = 30;
+/* 0x60 上报周期(ms)。
+ * ★ 2026-09-27：由 30(≈33Hz) 改为 16(≈62.5Hz)。
+ *   原因：PC 侧感受到的"读数滞后"主要来自本周期的量化误差
+ *         （均值 T/2、最坏 T）—— 30ms 时均值 15ms、最坏 30ms。
+ *         改成 16ms 后滞后降到均值 8ms、最坏 16ms。
+ *   带宽核算：31B × 62.5 ≈ 1.94 kB/s，USB FS CDC 绰绰有余。
+ *   下限约束：上报在 AlgorithmTask 主循环里（约 3ms/轮），16ms 远在其上，无压力。 */
+volatile uint16_t usb_pc_report_ms = 16;
 
 volatile float    usb_pc_target_deg[6] = {0};
 volatile uint8_t  usb_pc_target_flag   = 0;
 volatile int8_t   usb_pc_enable_req    = -1;
+volatile uint8_t  usb_pc_hold_req      = 0;
 
 volatile uint32_t usb_pc_tx_cnt      = 0;
 volatile uint32_t usb_pc_tx_busy_cnt = 0;
@@ -51,7 +59,9 @@ volatile uint32_t usb_pc_tick        = 0;
  * 限制路数会导致整帧被拒、命令完全没反应（实机实测 reject_cnt 疯涨 write_cnt 恒 0）。 */
 volatile uint8_t  usb_pc_write_max_joints = 6;      /* 默认全部允许，安全靠限幅+超时+软限位 */
 volatile float    usb_pc_write_limit_deg  = 10.0f;  /* 单次限幅 10° */
-volatile uint16_t usb_pc_write_speed      = 0;      /* 0 = 舵机内部默认速度 */
+/* 速度/加速度：单位 ≈ 0.088 °/s per unit（2026-09-27 实测标定，见 .h 说明）。
+ * 默认 170 ≈ 12°/s：50° 行程约 4s 走完。0 = 舵机内部默认（最快）。 */
+volatile uint16_t usb_pc_write_speed      = 170;
 volatile uint8_t  usb_pc_write_acc        = 0;      /* 0 = 舵机内部默认加速度 */
 volatile uint16_t usb_pc_write_timeout_ms = 200;    /* 命令有效期 200ms */
 /* "已到位"阈值。
@@ -79,6 +89,7 @@ volatile uint32_t usb_pc_write_cnt        = 0;
 volatile uint32_t usb_pc_write_reject_cnt = 0;
 volatile uint32_t usb_pc_write_stale_cnt  = 0;
 volatile uint32_t usb_pc_write_stall_cnt  = 0;
+volatile uint32_t usb_pc_hold_cnt         = 0;
 volatile float    usb_pc_last_write_deg[6] = {0};
 volatile uint8_t  usb_pc_last_write_idx   = 0;
 
@@ -204,6 +215,16 @@ static void usb_pc_handle_rx(void)
         usb_pc_enable_req = (rx[4] != 0u) ? 1 : 0;
         break;
 
+    case USB_PC_ID_ARM_HOLD:   /* 0x63：立即原位保持（真正的"停"） */
+        if (dlen != USB_PC_DOWN_HOLD_LEN)
+        {
+            break;
+        }
+        /* 这里只置请求标志，真正的舵机写入放到 usb_pc_service() 里按固定顺序执行：
+         * 6 路 goal 写入约 12 次总线事务，集中在一处更好预期，也和 0x62 的处理方式一致。 */
+        usb_pc_hold_req = 1u;
+        break;
+
     default:
         break;
     }
@@ -218,6 +239,14 @@ void usb_pc_service(void)
     if (USB_Data_Ready_Flag != 0u)
     {
         usb_pc_handle_rx();
+    }
+
+    /* ①.5 0x63 HOLD 请求：把六路 goal 强制写成当前位置 ⇒ 机械臂真正停住。
+     *     （普通的"停发"做不到这件事 —— 舵机会继续奔向旧目标，见 .h 说明） */
+    if (usb_pc_hold_req != 0u)
+    {
+        usb_pc_hold_req = 0u;
+        (void)usb_pc_arm_hold_now();
     }
 
     /* ② 发：按周期限速上报 0x60 */
@@ -375,6 +404,56 @@ uint8_t usb_pc_arm_write_apply(void)
             done++;
         }
     }
+
+    return done;
+}
+
+/* ---------------- 0x63：立即原位保持（真正的"停"） ----------------
+ * 背景（2026-09-27 实测）：位置伺服是"持有目标"模型 —— 停止下发新目标后，
+ *   舵机仍会继续奔向最后写入的 goal 直到到达；脚本已停发 3s，J2 仍走了 9.49°、
+ *   J3 走了 8.70°（J3 是往上走，可排除重力）。
+ *   而想用普通 0x61 写"目标=当前位置"来刹车也不行：那会因差值 < eps 被判"已到位"，
+ *   不产生任何总线事务（见 usb_pc_arm_write_apply 的候选筛选）。
+ * ⇒ 本函数**绕过 eps 判定**，对六路逐个强制 `goal = 当前角`，并让残留目标失效。 */
+uint8_t usb_pc_arm_hold_now(void)
+{
+    uint8_t done = 0;
+
+    for (uint8_t i = 0; i < STS3215_NUM; i++)
+    {
+        float cur = 0.0f;
+
+        /* 读不到当前位置就跳过这一路 —— 不知道位置就写不出安全的 goal，
+         * 宁可这一路不写，也不要用过期角度看误差。 */
+        if (sts3215_get_deg(i, &cur) != 0)
+        {
+            continue;
+        }
+
+        if (sts3215_goto_deg(i, cur, usb_pc_write_speed, usb_pc_write_acc) == 0)
+        {
+            /* 把残留目标同步成当前角：即使随后 write_apply 又被调用，
+             * 目标与当前值相等也不会产生位移 */
+            usb_pc_target_deg[i]     = cur;
+            usb_pc_last_write_deg[i] = cur;
+            usb_pc_last_write_idx    = (uint8_t)(i + 1u);
+            done++;
+        }
+    }
+
+    /* 关键：清掉"生效标志"并让超时判定失效 —— 否则旧的 0x61 目标会在超时窗口内
+     * 被再次应用，等于白刹车。（PC 想继续驱动，重新发一帧 0x61 即可恢复） */
+    usb_pc_target_flag = 0u;
+    s_last_target_ms   = 0u;
+
+    /* 顺带把堵转计数清零：刹车后位置基准变了，旧的"没动"计数已无意义 */
+    for (uint8_t i = 0; i < STS3215_NUM; i++)
+    {
+        s_stall_cnt[i]     = 0u;
+        s_stall_ref_deg[i] = usb_pc_target_deg[i];
+    }
+
+    usb_pc_hold_cnt++;
 
     return done;
 }
