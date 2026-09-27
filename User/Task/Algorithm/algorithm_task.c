@@ -177,10 +177,13 @@ void AlgorithmTask_Entry(void const *argument)
          *   ② 按 usb_pc_report_ms 周期上报 0x60（6 关节角 + 使能状态，单位弧度）
          * 放在【组帧入队】之后：不影响 0x0302 的节拍。
          *
-         * 0x62 是 PC 请求使能/失能。这里复用按键那条通路（sts3215_set_torque_all），
-         * 保证"扭矩状态只有一个权威来源"，也免得两套逻辑互相打架。
-         * ⚠️ 0x61 的目标角只解析并存入 usb_pc_target_deg[]/usb_pc_target_flag，
-         *    【不驱动舵机】—— 主臂当前只读不写，写目标的应用逻辑尚未开发。 */
+         * 三条下行通路的分工：
+         *   0x62 使能/失能 → 复用按键那条通路(sts3215_set_torque_all)，在这里消费；
+         *                    这样"扭矩状态只有一个权威来源"，不会两套逻辑打架。
+         *   0x61 目标角    → usb_pc_arm_write_apply()（下面那个调用）：
+         *                    它是唯一会让机械产生运动的 PC 通路，带四道安全闸
+         *                    （必须已使能 / 未超时 / 单帧最多 N 路 / 相对当前角限幅），
+         *                    详见 usb_pc_link.h。 */
         if (usb_pc_enable_req >= 0)
         {
             const uint8_t want = (uint8_t)usb_pc_enable_req;
@@ -190,7 +193,10 @@ void AlgorithmTask_Entry(void const *argument)
                 (void)sts3215_set_torque_all(want);
             }
         }
+
+        /* 先收（更新 usb_pc_target_deg[]/flag），再应用 —— 顺序不能反 */
         usb_pc_service();
+        (void)usb_pc_arm_write_apply();
 
         /* ------------------------------ KEY 按键(PA15)：锁死 / 自由 ------------------------------
          * 按一次：六路舵机扭矩使能(锁死)。此时操作手被刚性固定 → 角度随之冻结 →

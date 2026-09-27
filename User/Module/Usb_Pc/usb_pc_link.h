@@ -70,4 +70,55 @@ extern volatile uint32_t usb_pc_tick;            /* 本模块被调用的次数�
  */
 void usb_pc_service(void);
 
+/* ==========================================================================================
+ *                      0x61 写位置：安全闸（全部 volatile，可在线调参）
+ * ==========================================================================================
+ * 设计原则：**默认最保守，靠显式调参放宽**。
+ * 因为"PC 直接驱动舵机"是本模块里唯一会让机械结构产生运动的通路，
+ * 所以默认值刻意压到最小（单帧只动 1 路、单次限幅 10°），先保证安全。
+ * ========================================================================================== */
+
+/* 单帧最多允许"发生变化"的关节数。默认 1。
+ * 若一帧里需要动的关节数超过本值 → 整帧拒绝执行（记入 usb_pc_write_reject_cnt）。
+ * 想一次跟踪整条臂时，把它放宽到 6。 */
+extern volatile uint8_t  usb_pc_write_max_joints;
+
+/* 每路相对【当前角】的限幅(度)。默认 10.0。
+ * 目标与当前角之差超过它就被钳到 ±本值后执行（不是拒绝，是缓慢逼近）。 */
+extern volatile float    usb_pc_write_limit_deg;
+
+/* 透传给 WritePosEx 的速度/加速度（0,0 = 用舵机内部默认值）。
+ * 想让它动得更慢/更柔，把速度调小（例如 100~300）。 */
+extern volatile uint16_t usb_pc_write_speed;
+extern volatile uint8_t  usb_pc_write_acc;
+
+/* 命令有效期(ms)。默认 200。
+ * 距最后一次收到 0x61 超过它 → 停止驱动。
+ * ★ 必要性：PC 一旦断连，usb_pc_target_flag 会一直保持 1、目标角也是最后一帧的值，
+ *   没有超时的话主臂会被"残留目标"持续驱动 —— 这是个真实的安全隐患。 */
+extern volatile uint16_t usb_pc_write_timeout_ms;
+
+/* "视为已到位"的角度阈值(度)。默认 0.5。
+ * 角度差小于它的关节不产生任何总线事务，所以 PC 持续重发同一目标也无额外开销。 */
+extern volatile float    usb_pc_write_eps_deg;
+
+/* ---- 调试计数（供 OctoLink / GDB 观察） ---- */
+extern volatile uint32_t usb_pc_write_cnt;         /* 实际执行移动的关节次数 */
+extern volatile uint32_t usb_pc_write_reject_cnt;  /* 因超过单帧路数闸被拒的帧数 */
+extern volatile uint32_t usb_pc_write_stale_cnt;   /* 因未使能 / 标志为0 / 超时而未执行的次数 */
+extern volatile float    usb_pc_last_write_deg[6]; /* 最近一次实际写入的目标角(度) */
+extern volatile uint8_t  usb_pc_last_write_idx;    /* 最近写入的通道号+1（0=从未写过） */
+
+/**
+ * @brief  0x61 写位置：把 PC 下发的目标角应用到舵机。由主循环调用。
+ * @note   四项安全闸，任一不满足即不执行（并计入相应计数）：
+ *           ① 必须已锁死（STS3215 的 sts3215_locked == 1）—— 自由态下不驱动舵机
+ *           ② 必须带生效标志，且距最后一次收到 0x61 未超过 usb_pc_write_timeout_ms
+ *           ③ 单帧内"需要动作"的关节数 ≤ usb_pc_write_max_joints（默认 1）
+ *           ④ 每路相对当前角限幅 usb_pc_write_limit_deg（默认 10°）
+ *         另：只要六路全景里有一路读数不可信，整帧不动（限幅判断必须基于真实当前角）。
+ * @return 本次实际执行移动的关节数（0 = 未执行任何动作）
+ */
+uint8_t usb_pc_arm_write_apply(void);
+
 #endif /* USB_PC_LINK_H */

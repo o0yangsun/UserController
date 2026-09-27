@@ -19,6 +19,7 @@ pc_arm_monitor.py —— PC 侧：读主臂板（0x60 帧）/ 下发命令（0x6
     python pc_arm_monitor.py COM7 --raw          # 额外打印每帧原始十六进制
     python pc_arm_monitor.py COM7 --enable 1     # 发 0x62 使能（0=失能），发完退出
     python pc_arm_monitor.py COM7 --target 0.1 0.2 0.3 0.4 0.5 0.6   # 发 0x61（弧度），发完退出
+    python pc_arm_monitor.py COM7 --target-deg 10 0 0 0 0 0 --hold 3  # 发 0x61（度），持续 3 秒
 
 依赖：pyserial      安装：pip install pyserial
 """
@@ -121,7 +122,19 @@ def main():
     ap.add_argument("--enable", type=int, choices=(0, 1), help="发 0x62：1=使能 0=失能，发完退出")
     ap.add_argument("--target", nargs=6, type=float, metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
                     help="发 0x61：6 个目标角【弧度】，发完退出")
+    ap.add_argument("--target-deg", nargs=6, type=float,
+                    metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+                    help="同 --target，但输入用【度】（内部自动换算成弧度）")
+    ap.add_argument("--hold", type=float, default=0.0,
+                    help="持续发送 0x61 的时长(秒)，默认 0=只发一次。"
+                         "★ 主臂每帧最多走 10°(限幅 usb_pc_write_limit_deg)，"
+                         "且 200ms 无新命令就停止(超时保护)，"
+                         "所以要把目标走完【必须持续发】。")
+    ap.add_argument("--rate", type=int, default=30, help="--hold 模式下的发送周期(ms)，默认 30")
     args = ap.parse_args()
+
+    if args.target_deg:
+        args.target = [x / 57.29577951 for x in args.target_deg]
 
     if not args.port:
         print("可用串口：")
@@ -146,11 +159,68 @@ def main():
         return 0
 
     if args.target:
-        ser.write(make_target_frame(args.target))
-        ser.flush()
-        print("已发送 0x61：%s rad" % [round(x, 4) for x in args.target])
-        time.sleep(0.2)
-        ser.close()
+        tgt_rad = list(args.target)
+        frame = make_target_frame(tgt_rad)
+
+        if args.hold <= 0:
+            ser.write(frame)
+            ser.flush()
+            print("已发送 0x61：%s rad  (= %s 度)"
+                  % ([round(x, 4) for x in tgt_rad],
+                     [round(x * 57.29577951, 2) for x in tgt_rad]))
+            print("⚠️ 只发一次的话，主臂最多走 %.1f°（限幅），且很快超时。"
+                  "要把目标走完请加 --hold <秒>" % 10.0)
+            time.sleep(0.2)
+            ser.close()
+            return 0
+
+        # ---- 持续发送模式：模拟上位机按周期刷新目标，让主臂一步步逼近 ----
+        tgtd = [r * 57.29577951 for r in tgt_rad]
+        print("持续发送 0x61  目标(度)=%s" % ["%.2f" % v for v in tgtd])
+        print("周期 %dms   时长 %.1fs   按 Ctrl+C 可提前结束" % (args.rate, args.hold))
+        print()
+        hdr = "  时间  使能  " + "  ".join("%8s" % ("J%d" % i) for i in range(1, 7)) + "   最大偏差"
+        print(hdr)
+        print("-" * len(hdr))
+
+        parser = StreamParser()
+        t0 = time.time()
+        last_tx = 0.0
+        last_print = 0.0
+        latest = None
+        ntx = 0
+
+        try:
+            while (time.time() - t0) < args.hold:
+                now = time.time()
+                if (now - last_tx) >= args.rate / 1000.0:
+                    ser.write(frame)
+                    ser.flush()
+                    last_tx = now
+                    ntx += 1
+
+                data = ser.read(256)
+                if data:
+                    for nid, payload in parser.feed(data):
+                        if nid == ID_UP and len(payload) >= 25:
+                            latest = decode_0x60(payload)
+
+                if latest and (now - last_print) >= 0.3:
+                    rad, en = latest
+                    degs = [r * 57.29577951 for r in rad]
+                    dmax = max(abs(degs[i] - tgtd[i]) for i in range(6))
+                    mark = "   ← 已到位" if dmax < 0.5 else ""
+                    print("%6.1fs  %-4s  %s   %6.2f%s"
+                          % (now - t0, en, "  ".join("%8.2f" % v for v in degs), dmax, mark))
+                    last_print = now
+        except KeyboardInterrupt:
+            pass
+        finally:
+            el = time.time() - t0
+            print()
+            print("共发 %d 帧 0x61，收到 %d 帧上行，用时 %.1fs（校验失败 %d）"
+                  % (ntx, parser.frames, el, parser.bad))
+            ser.close()
         return 0
 
     # ---- 监视模式 ----

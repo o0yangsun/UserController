@@ -46,9 +46,24 @@ volatile uint32_t usb_pc_rx_bad_cnt  = 0;
 volatile uint32_t usb_pc_last_id     = 0;
 volatile uint32_t usb_pc_tick        = 0;
 
+/* ---------------- 0x61 写位置：安全闸（默认值刻意保守，见 .h 说明） ---------------- */
+volatile uint8_t  usb_pc_write_max_joints = 1;      /* 单帧只允许 1 路变化 */
+volatile float    usb_pc_write_limit_deg  = 10.0f;  /* 单次限幅 10° */
+volatile uint16_t usb_pc_write_speed      = 0;      /* 0 = 舵机内部默认速度 */
+volatile uint8_t  usb_pc_write_acc        = 0;      /* 0 = 舵机内部默认加速度 */
+volatile uint16_t usb_pc_write_timeout_ms = 200;    /* 命令有效期 200ms */
+volatile float    usb_pc_write_eps_deg    = 0.5f;   /* 小于 0.5° 视为已到位 */
+
+volatile uint32_t usb_pc_write_cnt        = 0;
+volatile uint32_t usb_pc_write_reject_cnt = 0;
+volatile uint32_t usb_pc_write_stale_cnt  = 0;
+volatile float    usb_pc_last_write_deg[6] = {0};
+volatile uint8_t  usb_pc_last_write_idx   = 0;
+
 /* ---------------- 内部状态 ---------------- */
 static uint8_t  s_txbuf[USB_PC_UP_FRAME_LEN];
 static uint32_t s_last_report_ms = 0;
+static uint32_t s_last_target_ms = 0;   /* 最后一次收到 0x61 的时刻（供超时判定） */
 
 /* ---------------- 校验：sum + 累加和(addr)，与车端逐字节一致 ----------------
  * sum 覆盖 [0 .. 4+dlen-1]（即 帧头..数据末字节），两个校验值都取低 8 位。 */
@@ -144,11 +159,15 @@ static void usb_pc_handle_rx(void)
         {
             int32_t v = 0;
             memcpy(&v, &rx[4 + i * 4], sizeof(int32_t));
-            /* ★ 弧度 → 度，存成主臂内部单位；是否驱动舵机由使用方决定
-             *   （当前主臂固件只读不写 —— 写目标的应用逻辑尚未开发） */
+            /* ★ 弧度 → 度，存成主臂内部单位。
+             *   本函数【只解析存储，不驱动舵机】—— 真正的执行在
+             *   usb_pc_arm_write_apply() 里，且要过四道安全闸（见 .h）。
+             *   这样"收包"与"动机械"彻底解耦：即使解析出了离谱的目标角，
+             *   也不会在这里直接作用到舵机上。 */
             usb_pc_target_deg[i] = (float)v / USB_PC_SCALE * USB_PC_RAD2DEG;
         }
         usb_pc_target_flag = rx[4 + 24];
+        s_last_target_ms   = HAL_GetTick();   /* 记录时刻，供 usb_pc_arm_write_apply 做超时判定 */
         break;
 
     case USB_PC_ID_ARM_ENABLE:   /* 0x62：使能 / 失能请求 */
@@ -182,4 +201,105 @@ void usb_pc_service(void)
         s_last_report_ms = now;
         usb_pc_send_report();
     }
+}
+
+/* ---------------- 0x61 写位置：应用 PC 下发的目标角 ---------------- */
+uint8_t usb_pc_arm_write_apply(void)
+{
+    /* ---------- 安全闸 ①：必须已锁死 ----------
+     * 自由态(sts3215_locked == 0)下不驱动舵机。
+     * 理由：自由态意味着操作手要用手拖动机械臂做遥操作，
+     *      此时如果 PC 还能让它自己动，会与操作手"抢"机械臂，既危险又混乱。
+     *      ⇒ 想用 PC 驱动，先按 PA15 或发 0x62 使能。 */
+    if (sts3215_locked == 0u)
+    {
+        usb_pc_write_stale_cnt++;
+        return 0;
+    }
+
+    /* ---------- 安全闸 ②：必须有生效请求且未超时 ---------- */
+    if (usb_pc_target_flag == 0u)
+    {
+        usb_pc_write_stale_cnt++;
+        return 0;
+    }
+    /* 超时保护：PC 断连后 flag 会一直保持 1、目标角也停在最后一帧，
+     * 不设超时的话主臂会被"残留目标"持续驱动 —— 这是真实隐患，必须有。 */
+    if ((uint32_t)(HAL_GetTick() - s_last_target_ms) > (uint32_t)usb_pc_write_timeout_ms)
+    {
+        usb_pc_write_stale_cnt++;
+        return 0;
+    }
+
+    /* ---------- 先读六路当前角，挑出"需要动作"的关节 ---------- */
+    float   cur[STS3215_NUM];
+    uint8_t cand[STS3215_NUM];
+    uint8_t n = 0;
+
+    for (uint8_t i = 0; i < STS3215_NUM; i++)
+    {
+        if (sts3215_get_deg(i, &cur[i]) != 0)
+        {
+            /* 任一路读数不可信 → 整帧不动。
+             * 理由：限幅判断必须基于真实当前角，拿不到就不该盲动
+             *      （宁可这一帧不执行，也不要基于过期角度去算位移）。 */
+            usb_pc_write_stale_cnt++;
+            return 0;
+        }
+
+        const float d = usb_pc_target_deg[i] - cur[i];
+        if (d > usb_pc_write_eps_deg || d < -usb_pc_write_eps_deg)
+        {
+            cand[n++] = i;
+        }
+    }
+
+    if (n == 0u)
+    {
+        /* 六路都已在容差内 ⇒ 不产生任何总线事务。
+         * 这正是"PC 持续重发同一目标也不会造成额外开销"的原因。 */
+        return 0;
+    }
+
+    /* ---------- 安全闸 ③：单帧只允许 N 路变化（默认 1） ----------
+     * 一帧里有多路同时超出容差时整帧拒绝，而不是"只做第一路"——
+     * 拒绝比分批偷偷动更可预期，也让 PC 侧立刻能从 reject_cnt 发现动作超范围。 */
+    if (n > usb_pc_write_max_joints)
+    {
+        usb_pc_write_reject_cnt++;
+        return 0;
+    }
+
+    /* ---------- 安全闸 ④：逐路相对当前角限幅后执行 ---------- */
+    uint8_t done = 0;
+
+    for (uint8_t k = 0; k < n; k++)
+    {
+        const uint8_t i = cand[k];
+        float d = usb_pc_target_deg[i] - cur[i];
+
+        /* 超限不是拒绝，而是"钳到边界缓慢逼近"：
+         * 这样即使 PC 一次给了大目标，主臂也会按 10°/次 的节奏走过去，
+         * 不会突然大幅甩动。 */
+        if (d > usb_pc_write_limit_deg)
+        {
+            d = usb_pc_write_limit_deg;
+        }
+        else if (d < -usb_pc_write_limit_deg)
+        {
+            d = -usb_pc_write_limit_deg;
+        }
+
+        const float tgt = cur[i] + d;
+
+        if (sts3215_goto_deg(i, tgt, usb_pc_write_speed, usb_pc_write_acc) == 0)
+        {
+            usb_pc_last_write_deg[i] = tgt;
+            usb_pc_last_write_idx    = (uint8_t)(i + 1u);
+            usb_pc_write_cnt++;
+            done++;
+        }
+    }
+
+    return done;
 }

@@ -400,18 +400,73 @@ USB 是**第三条独立通道**，USART1（舵机总线）与 USART10（0x0302 
 | 挂载点 | `algorithm_task.c` 主循环、**组帧入队之后**（不影响 0x0302 节拍） |
 | 上报周期 | `usb_pc_report_ms = 30`（`volatile`，可用调试器在线改） |
 | 发送失败策略 | `CDC_Transmit_HS()` 返回 `USBD_BUSY` 时**丢弃本帧、不重试**（沿用车端策略） |
-| `0x61` 目标角 | **只解析存入 `usb_pc_target_deg[]`，不驱动舵机** —— 写目标的应用逻辑尚未开发 |
+| `0x61` 目标角 | 解析存入 `usb_pc_target_deg[]`，再由 `usb_pc_arm_write_apply()` **过四道安全闸后执行**（见 14.7） |
 | `0x62` 使能 | 复用按键那条 `sts3215_set_torque_all()` 通路，保证扭矩状态只有一个权威来源 |
-| 调试计数 | `usb_pc_tx_cnt` / `tx_busy_cnt` / `rx_cnt` / `rx_bad_cnt` / `last_id` / `tick` |
+| 调试计数 | 上行：`usb_pc_tx_cnt` / `tx_busy_cnt` / `rx_cnt` / `rx_bad_cnt` / `last_id` / `tick`<br>写位置：`usb_pc_write_cnt` / `write_reject_cnt` / `write_stale_cnt` / `last_write_deg[]` / `last_write_idx` |
 
-### 14.6 PC 侧工具
+### 14.7 `0x61` 写位置：安全闸与换算（`0x6x` 段唯一会动机械的通路）
+
+**这是整条 PC 链路里唯一会让机械结构产生运动的通路**，所以专门做了四道闸，默认值刻意保守。
+
+| # | 闸门 | 默认 | 行为 |
+| --- | --- | --- | --- |
+| ① | 必须已使能 | — | `sts3215_locked == 1` 才动；自由态下 PC 无法驱动（避免与操作手"抢"机械臂） |
+| ② | 命令超时 | `usb_pc_write_timeout_ms = 200` | 距最后一次收到 `0x61` 超过它就停止。★ 防止 **PC 断连后残留目标持续驱动**（目标与标志都不会自己清零） |
+| ③ | 单帧路数 | `usb_pc_write_max_joints = 1` | 一帧内"需要动作"的关节数超过它 → **整帧拒绝**（记入 `write_reject_cnt`），而不是"只做第一路" |
+| ④ | 相对当前角限幅 | `usb_pc_write_limit_deg = 10.0` | 目标与当前角之差超过 ±10° 就**钳到边界缓慢逼近**，不是拒绝 |
+
+另：只要六路里有一路读数不可信，**整帧不动** —— 限幅判断必须基于真实当前角，拿不到就不该盲动。
+角度差小于 `usb_pc_write_eps_deg`（默认 0.5°）的关节视为"已到位"，**不产生任何总线事务**
+（所以 PC 持续重发同一目标不会造成额外开销）。
+
+全部参数都是 `volatile`，**可用调试器在线改**，不必重新烧录。
+
+#### ★ 行为约定：必须"持续发"才能走完全程
+
+因为限幅是 10°/帧、超时是 200ms，所以：
+
+- **PC 发一次 `0x61`** ⇒ 主臂最多走 10° 就停
+- **PC 按周期持续发（如 30ms）** ⇒ 主臂按 10°/帧 的节奏一步步逼近，最终精确到位
+
+这正是"上位机做闭环控制 / 数据采集"的自然语义。仿真验证：从 −160° 走到 +160° 的
+**578 个组合全部收敛，最大偏差 0.742°**。
+
+#### 角度 → 刻度的换算（`sts3215_goto_deg()`）
+
+主臂的 `total_encoder_value` 是**增量累加**量，且累加时已乘过方向，所以不能用角度直接当刻度写：
+
+```c
+target_total = target_deg × (4096/360)            /* 度 -> 累计刻度 */
+raw_target   = raw_now + sts3215_dir[i] × (target_total - enc->total_encoder_value)
+```
+
+两道硬保护（越界直接拒绝，**不做绕圈处理** —— 绕一圈会让舵机猛转 360°）：
+
+- 单次位移 `|delta_total| > 2047` 刻度（半圈）⇒ 拒绝。否则下一轮采样会把它误判成
+  "过零跳变"（`sts3215_angle_get` 的 ±2048 修正），角度彻底错乱
+- 换算结果 `raw_target` 落在 0~4095 之外 ⇒ 拒绝（目标角超出该关节可达范围）
+
+执行前还会**清该路死区累积器**，否则被暂扣的差值会叠加进本次位移，使上报角度滞后最多 0.7°。
+
+### 14.8 PC 侧工具
 
 ```bash
 pip install pyserial
 python tools/pc_arm_monitor.py                 # 列出串口
 python tools/pc_arm_monitor.py COM7 --deg      # 持续监视（角度制）
 python tools/pc_arm_monitor.py COM7 --enable 1 # 发 0x62 使能
-python tools/pc_arm_monitor.py COM7 --target 0.1 0.2 0.3 0.4 0.5 0.6   # 发 0x61（弧度）
+
+# 发 0x61 目标角：单纯发一次只能走 10°，要把目标走完必须 --hold 持续发
+python tools/pc_arm_monitor.py COM7 --target-deg 10 0 0 0 0 0 --hold 3
+```
+
+`--hold` 模式下会一边按 `--rate`（默认 30ms）周期重发目标、一边打印六路实际角度与
+**最大偏差**，到位后标 `← 已到位`，可以直观看到一步步逼近的过程。
+
+```bash
+# 只动 J1 到 10°，持续 3 秒（验证单关节跟踪）
+python tools/pc_arm_monitor.py COM10 --enable 1
+python tools/pc_arm_monitor.py COM10 --target-deg 10 0 0 0 0 0 --hold 3
 ```
 
 内置的 `StreamParser` 是**字节流解析器**（能吃粘包/断包，校验失败只丢 1 字节重新同步），

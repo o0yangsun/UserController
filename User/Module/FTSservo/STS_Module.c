@@ -348,3 +348,89 @@ uint8_t sts3215_set_torque_all(uint8_t enable)
 
     return ok;
 }
+
+/* ==========================================================================================
+ *                    PC 下发目标角(0x61)：单路移动（执行层原语）
+ * ==========================================================================================
+ * 用途：把某个关节移动到指定的【绝对角度】(主臂内部单位：度，相对上电基准)。
+ *       PC 侧(上位机 / 数据采集 / 推理)按 0x61 下发弧度，本模块先转成度，
+ *       再由这里的换算把"目标角度"变成"舵机原始刻度"写进 GOAL_POSITION。
+ *
+ * ★ 为什么不能直接把角度当刻度写
+ *   STS3215 的 12-bit 编码器读到的是 raw(0~4095)，而主臂上报的 total_angle 是
+ *   【相对上电基准的增量累加量】(还乘过方向 dir)，两者不是同一个坐标系。
+ *   必须用"当前 raw + 需要改变的累计刻度 × dir"反推目标 raw。
+ *
+ * ★ 本层不做安全策略：限幅/使能/单帧路数等闸门在 usb_pc_link.c 里统一实施。
+ * ========================================================================================== */
+
+int sts3215_get_deg(uint8_t idx, float *out_deg)
+{
+    if (idx >= STS3215_NUM || out_deg == 0)
+    {
+        return -1;
+    }
+
+    /* is_received 反映"最近一次读取是否真的成功"：
+     * 为 0 时 total_angle 还是旧值(可能已过期几百 ms)，当作当前角用会算错位移。 */
+    if (sts3215_encoder[idx].is_received == 0)
+    {
+        return -1;
+    }
+
+    *out_deg = sts3215_encoder[idx].total_angle;
+    return 0;
+}
+
+int sts3215_goto_deg(uint8_t idx, float target_deg, uint16_t speed, uint8_t acc)
+{
+    if (idx >= STS3215_NUM)
+    {
+        return -1;
+    }
+
+    STS3215_Encoder_t *enc = &sts3215_encoder[idx];
+    const uint8_t id = motor_ids[idx];
+
+    /* ① 重读一次原始刻度：确认"这一路此刻通信正常" —— 读不到就绝不写。
+     *    （已有 enc->encoder_value 是上一次采样的值，可能已过 3ms，不适合作为写入基准。） */
+    const int raw_now = ReadPos(id);
+    if (raw_now < 0 || raw_now > 4095)
+    {
+        return -1;
+    }
+
+    /* ② 目标角度 → 目标累计刻度（四舍五入到整数刻度，1 刻度 = 0.0879°） */
+    const float   target_total_f = target_deg * (4096.0f / 360.0f);
+    const int32_t target_total   = (int32_t)(target_total_f + (target_total_f >= 0.0f ? 0.5f : -0.5f));
+
+    /* ③ 需要改变的累计刻度量 */
+    const int32_t delta_total = target_total - enc->total_encoder_value;
+
+    /* ④ 硬保护：单次位移不得超过半圈。
+     *    理由：sts3215_angle_get() 用 ±2048 判"过零跳变"，
+     *    若这次写入让 raw 跳超过半圈，下一轮采样会把它当成绕圈修正 → 角度彻底错乱。
+     *    （正常调用方会先限幅到 10° 量级，这里只是最后一道保险。） */
+    if (delta_total > 2047 || delta_total < -2047)
+    {
+        return -1;
+    }
+
+    /* ⑤ 累计刻度 → 原始刻度增量。累加时是 total += diff_raw * dir，
+     *    故 diff_raw = delta_total * dir（dir 为 ±1，乘除等价）。 */
+    const int32_t raw_target = (int32_t)raw_now + delta_total * (int32_t)sts3215_dir[idx];
+
+    /* ⑥ 12-bit 量程检查：越界说明目标角超出该关节可达范围。
+     *    直接拒绝，【不做绕圈处理】—— 绕一圈会让舵机猛转 360°，风险远大于收益。 */
+    if (raw_target < 0 || raw_target > 4095)
+    {
+        return -1;
+    }
+
+    /* ⑦ 清死区累积器：否则"被暂扣的差值"会叠加进本次位移，
+     *    使上报角度滞后最多 ±8 刻度(0.7°)，导致 PC 侧的闭环判断偏一点。 */
+    enc->deadband_accum = 0;
+
+    WritePosEx(id, (int16_t)raw_target, speed, acc);
+    return 0;
+}
