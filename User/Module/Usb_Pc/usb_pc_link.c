@@ -503,6 +503,26 @@ uint8_t usb_pc_arm_write_apply(void)
 
             if (s_stalled[i] == 0u)
             {
+                /* ★★ 2026-09-28 修正：首次评估只建立基准，不判堵转。
+                 *
+                 * 缺陷：`s_stall_ref_ms[]` / `s_stall_ref_deg[]` 都是 static，初值 0。
+                 *   复位后六路都读 0.000，而 ref_deg 初值也是 0
+                 *   ⇒ `moved = 0` 被判成"没动"，且 `now_ms - 0` = 上电至今几十秒 ≫ 观察窗
+                 *   ⇒ 【上电后第一次用 0x61 驱动就被误判堵转并锁存】。
+                 *   而锁存后需"目标变化 ≥3° + 间隔 ≥1s"才放行 ⇒ 若 PC 用【固定目标】驱动
+                 *   （不逐步推进），该路就永远不动。
+                 *   实测：烧录后复位、发固定目标 J5 +20°，rx_cnt=65 而 **write_cnt=0**，
+                 *   stall_cnt=1 / unload=1（第一帧即跃迁）。
+                 *
+                 * 修法：用 `ref_ms == 0` 作为"本次上电还没建立基准"的哨兵 ——
+                 *   HAL_GetTick() 上电后很快非 0，且首个 0x61 必在 USB 枚举之后到达，可靠。
+                 *   首次只做同步（ref = 当前角、ref_ms = now），本帧不判堵转。 */
+                if (s_stall_ref_ms[i] == 0u)
+                {
+                    s_stall_ref_deg[i] = cur[i];
+                    s_stall_ref_ms[i]  = now_ms;
+                }
+
                 const float moved = cur[i] - s_stall_ref_deg[i];
                 const int   moving = (moved > usb_pc_stall_eps_deg) ||
                                      (moved < -usb_pc_stall_eps_deg);
