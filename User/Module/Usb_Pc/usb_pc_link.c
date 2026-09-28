@@ -73,13 +73,38 @@ volatile uint16_t usb_pc_write_timeout_ms = 200;    /* 命令有效期 200ms */
 volatile float    usb_pc_write_eps_deg    = 1.5f;
 
 /* 逐路软限位。★ 必须按实机机械行程填写。
- * 已知：底座(J1，索引 0) 的机械行程为 ±90°（2026-09-27 用户确认），
- *       故默认给它留 5° 余量、限到 ±85 —— 这样即使 PC 发来超程目标，
- *       也只走到 85° 就停，不会顶在限位上满力堵转。
- *       其余关节行程未知，暂用 ±170（几乎不限制），后续按实机填写。
+ *
+ * 实测来源（2026-09-28，用户用 OctoLink 读 `total_angle` 在机械两端取值）：
+ *   J1 -90 ~ +90    J2 -170 ~ 0     J3    0 ~ +180
+ *   J4 -180 ~ +180  J5  -25 ~ +90   J6 -180 ~ +180
+ *
+ * ⚠️ 这些值是【相对上电/复位基准】的角度 —— 所以每次上电（或 reset）时，
+ *    机械臂必须停在【与测量时相同的参考姿态】，否则这组限位整体偏移，
+ *    后果是"某一侧提前被限制"或"另一侧失去保护"。这是使用前提，不是 bug。
+ *
+ * 内缩余量：不直接把实测值当边界，而是向内收 USB_PC_SOFT_MARGIN_DEG。
+ *   理由：软限位是"把目标钳到边界"，若边界=机械硬限位，它仍会一路走到并停在硬限位上；
+ *         再叠加读数估计误差（舵机死区 ±1.5° 量级），可能在极限处形成持续微顶。
+ *         内缩一点即彻底不接触。想用实测原值，把下面这个宏改成 0.0f 即可。
  * 两者都是 volatile，调试器可在线改，不必重烧。 */
-volatile float    usb_pc_soft_min_deg[6] = {-85.0f, -170.0f, -170.0f, -170.0f, -170.0f, -170.0f};
-volatile float    usb_pc_soft_max_deg[6] = { 85.0f,  170.0f,  170.0f,  170.0f,  170.0f,  170.0f};
+#define USB_PC_SOFT_MARGIN_DEG      3.0f
+
+volatile float    usb_pc_soft_min_deg[6] = {
+    -90.0f  + USB_PC_SOFT_MARGIN_DEG,   /* J1 实测 -90  → -87   */
+    -170.0f + USB_PC_SOFT_MARGIN_DEG,   /* J2 实测 -170 → -167  */
+      0.0f  + USB_PC_SOFT_MARGIN_DEG,   /* J3 实测 0    → +3    */
+    -180.0f + USB_PC_SOFT_MARGIN_DEG,   /* J4 实测 -180 → -177  */
+    -25.0f  + USB_PC_SOFT_MARGIN_DEG,   /* J5 实测 -25  → -22   */
+    -180.0f + USB_PC_SOFT_MARGIN_DEG,   /* J6 实测 -180 → -177  */
+};
+volatile float    usb_pc_soft_max_deg[6] = {
+     90.0f  - USB_PC_SOFT_MARGIN_DEG,   /* J1 → +87   */
+       0.0f - USB_PC_SOFT_MARGIN_DEG,   /* J2 → -3    */
+    180.0f  - USB_PC_SOFT_MARGIN_DEG,   /* J3 → +177  */
+    180.0f  - USB_PC_SOFT_MARGIN_DEG,   /* J4 → +177  */
+     90.0f  - USB_PC_SOFT_MARGIN_DEG,   /* J5 → +87   */
+    180.0f  - USB_PC_SOFT_MARGIN_DEG,   /* J6 → +177  */
+};
 
 /* 堵转保护：★ 2026-09-27 改为【按真实时间窗】判定，不再按"调用次数"。
  * 原写法"连续 20 次调用位移 < eps"是按 30ms/次估的 0.6s，但本函数实际被主循环
