@@ -2,7 +2,7 @@
 """
 主臂控制器 · 一键回归验证（烧录新固件后跑这一条即可）
 
-覆盖 6 个阶段，每阶段独立判定 PASS/FAIL，最后给汇总表：
+覆盖 8 个验收阶段 + 收尾，每阶段独立判定 PASS/FAIL，最后给汇总表：
 
   ① 上行链路   0x60 帧质量：帧率 / 校验失败 / 帧长 / 命名 ID
   ② 下行链路   0x62 使能/失能：用上行帧里的使能位自证（发出去必须回得来）
@@ -16,13 +16,16 @@
       为什么不直接发"边界外 8°"：软限位是实测行程内缩 3°得出的，
       边界外 8° 已落在机械行程之外，无法区分"被钳位"与"只是被 eps 提前停住"。
   ⑤ 0x63 刹车  运动中发 0x63 → 位移应当场归零（对照：只停发会继续走完旧目标）
-  ⑥ 收尾       恢复姿态 + 刹车；可选失能
+  ⑦ 堵转保护   命令一个"到不了"的目标 → 应判堵转 + 卸载推力；
+                目标再变 ≥3° → 应放行一次重试并真的动起来（§14.10 的两个修复）
+  ⑧ 超时门     停发后 >200ms 不得再驱动（用 write_cnt 增量自证）
+  ⑨ 收尾       恢复姿态 + 刹车；可选失能
 
 用法：
     python regress.py COM10                 # 默认用 J5 做被试关节
     python regress.py COM10 --joint 1       # 换关节
     python regress.py COM10 --skip-softlimit --skip-brake     # 只跑链路
-    python regress.py COM10 --octo          # 额外读固件计数器（③/④ 的严格判据需要它）
+    python regress.py COM10 --octo          # 额外读固件计数器（③/⑦/⑧ 的严格判据需要它）
     python regress.py COM10 --no-hardening  # 不做"先发 0x63"的严格化（旧行为）
 
 安全设计：
@@ -238,6 +241,33 @@ class Link:
 
     def target(self, degs, secs, rate):
         return self.send(m.make_target_frame([d * DTOR for d in degs]), secs, rate)
+
+    def target_two(self, d1, secs1, d2, secs2, rate):
+        """★ 连续发送两段目标，中间【不停发】，返回 [(t, [6 路角])] 轨迹。
+
+        为什么必须不停发（实测踩到）：只要中间停发一下（>200ms 超时），
+        固件就会把"本轮持续命令"结束掉（§14.16 的 `stall_round_end`），
+        下一帧命令于是走【新一轮重新锚定】路径 —— 它会**静默解除堵转锁存**
+        （`s_stalled=0` 但不计 `retry_cnt`）⇒ 看起来"目标一变就恢复"，
+        却**测不到 retry 重试机制本身**。要测 retry，目标必须在一轮连续命令内变化。
+        """
+        f1 = m.make_target_frame([d * DTOR for d in d1])
+        f2 = m.make_target_frame([d * DTOR for d in d2])
+        trace = []
+        t0 = time.time()
+        last = t0
+        while time.time() - t0 < secs1 + secs2:
+            if time.time() - last >= rate:
+                self.ser.write(f1 if (time.time() - t0) < secs1 else f2)
+                self.ser.flush()
+                last = time.time()
+            d = self.ser.read(4096)
+            if d:
+                for nid, pl in self.p.feed(d):
+                    if nid == 0x60 and len(pl) == 25:
+                        trace.append((time.time() - t0,
+                                      [v * RTOD for v in m.decode_0x60(pl)[0]]))
+        return trace
 
     def enable(self, on):
         self.send(m.make_enable_frame(on), 0.05, 0.03)
@@ -549,9 +579,109 @@ def main():
                         '（应 ≈0；<1.0° 说明"没在飞"、判据无意义）'
                         % (args.joint, inflight, tgt5[JI] - cur[JI], d_after))
 
-        # ================= ⑥ 收尾 =================
+        # ================= ⑦ 堵转保护三件套（判堵转 → 卸载 → 目标变化后重试）=================
         print()
-        print('【⑥ 收尾】恢复到基准姿态附近 + 刹车')
+        print('【⑦ 堵转保护：连续命令流里目标不可达 → 判堵转+卸载；目标再变 ≥3° → 放行重试】')
+        print('    ⚠️ 两段之间【不能停发】—— 停发会走"新一轮命令重新锚定"的静默解锁路径，'
+              '就测不到 retry 机制了')
+        cur, _, _, _ = lk.drain(0.4)
+        tight = pick_tighten(cur, JI, step_deg=8.0, req_deg=40.0) if cur else None
+        t1 = None
+        if cur is not None:
+            t1 = list(cur)
+            t1[JI] = tight[3] if tight else cur[JI]
+        if not (oc and oc.enabled):
+            rec('⑦', False, '需要 --octo 才能读到堵转计数')
+        elif cur is None:
+            rec('⑦', False, '取不到上行帧')
+        elif tight is None:
+            rec('⑦', False, '该姿态下找不到可收紧的边界，已跳过')
+        elif not guard(t1, '⑦', JI):
+            rec('⑦', False, '目标越界，已跳过')
+        else:
+            side, expr, tval, req = tight
+            orig = SOFT[JI][1] if side == 'max' else SOFT[JI][0]
+            got = None
+            if oc.write(expr, tval):
+                got = fnum(oc.read([expr]).get(expr))
+            if got is None or abs(got - tval) > 0.05:
+                oc.write(expr, orig)
+                rec('⑦', False, '收紧值读回异常（%s），已恢复' % got)
+            else:
+                saved_bound = (expr, orig)
+                # 第2段目标：变化 ≥3°（此处 ≈37°）且落在可达范围内
+                t2 = list(t1)
+                t2[JI] = (tval - 5.0) if side == 'max' else (tval + 5.0)
+                c0 = oc.read(COUNTER_NAMES)
+                trace = lk.target_two(t1, 3.0, t2, 2.5, args.rate)   # ★ 连续，不断流
+                c1 = oc.read(COUNTER_NAMES)
+
+                def dlt(a, b, k):
+                    x, y = fnum(a.get(k)), fnum(b.get(k))
+                    return None if (x is None or y is None) else int(y - x)
+
+                d_stall = dlt(c0, c1, 'usb_pc_write_stall_cnt')
+                d_unl = dlt(c0, c1, 'usb_pc_stall_unload_cnt')
+                d_skip = dlt(c0, c1, 'usb_pc_write_stall_skip_cnt')
+                d_retry = dlt(c0, c1, 'usb_pc_stall_retry_cnt')
+                peak = max((a[JI] for _, a in trace), default=None)
+                fin = trace[-1][1][JI] if trace else None
+                ok_peak = (peak is not None) and (abs(peak - tval) <= 2.5)
+                ok_fin = (fin is not None) and (abs(fin - t2[JI]) <= 2.0)
+                ok7 = (d_stall == 1) and (d_unl == 1) and (d_skip or 0) > 0 \
+                      and (d_retry or 0) >= 1 and ok_peak and ok_fin
+                rec('⑦', ok7,
+                    '①不可达段：stall Δ=%s(应1) unload Δ=%s(应1) skip Δ=%s(应>0)、'
+                    '最高到 %s°（收紧值 %+.1f°）；②改目标段：retry Δ=%s(应≥1)、'
+                    '末角 %s°（目标 %+.1f°）'
+                    % (d_stall, d_unl, d_skip,
+                       ('%+.2f' % peak) if peak is not None else '?', tval,
+                       d_retry, ('%+.2f' % fin) if fin is not None else '?', t2[JI]))
+                oc.write(expr, orig)
+                rb = fnum(oc.read([expr]).get(expr))
+                saved_bound = None
+                print('    （边界已恢复 %s = %s）' % (expr, rb))
+
+        # ================= ⑧ 200ms 超时门 =================
+        print()
+        print('【⑧ 200ms 超时门：PC 停发后不得再驱动（但舵机仍会走完最后写入的目标）】')
+        cur, _, _, _ = lk.drain(0.4)
+        if cur is None:
+            rec('⑧', False, '取不到上行帧')
+        else:
+            lo, hi = SOFT[JI]
+            direction = 1.0 if abs(hi - cur[JI]) > abs(cur[JI] - lo) else -1.0
+            t8 = list(cur)
+            t8[JI] = max(lo, min(hi, cur[JI] + direction * 20.0))
+            if not guard(t8, '⑧', JI):
+                rec('⑧', False, '目标越界，已跳过')
+            else:
+                lk.target(t8, 1.0, args.rate)              # 送 1s
+                a0, _, _, _ = lk.drain_ok(0.05)            # 停发那一刻
+                c1 = oc.read(COUNTER_NAMES) if (oc and oc.enabled) else {}
+                time.sleep(0.5)                            # 让 200ms 超时生效
+                c2 = oc.read(COUNTER_NAMES) if (oc and oc.enabled) else {}
+                time.sleep(1.1)
+                c3 = oc.read(COUNTER_NAMES) if (oc and oc.enabled) else {}
+                a1, _, _, _ = lk.drain_ok(0.1)
+                time.sleep(0.4)
+                a2, _, _, _ = lk.drain_ok(0.1)
+                d_tail = abs(a1[JI] - a0[JI]) if (a0 and a1) else float('nan')
+                d_settle = abs(a2[JI] - a1[JI]) if (a1 and a2) else float('nan')
+                d_write = None
+                if c2 and c3:
+                    x, y = fnum(c2.get('usb_pc_write_cnt')), fnum(c3.get('usb_pc_write_cnt'))
+                    d_write = None if (x is None or y is None) else int(y - x)
+                lk.hold()                                   # 刹车收尾
+                ok8 = (d_settle <= 0.3) and (d_write in (None, 0))
+                rec('⑧', ok8,
+                    '停发后走完"最后写入的目标"追加 %.3f°（受单帧 10° 上限约束）、'
+                    '末段 0.4s 位移 %.3f°（应 ≈0）；超时【之后】的新增写入 Δ=%s（应为 0）'
+                    % (d_tail, d_settle, d_write))
+
+        # ================= ⑨ 收尾 =================
+        print()
+        print('【⑨ 收尾】恢复到基准姿态附近 + 刹车')
         cur, _, _, _ = lk.drain(0.4)
         back = list(base)
         if cur is None or not guard(back, '⑥', JI):
