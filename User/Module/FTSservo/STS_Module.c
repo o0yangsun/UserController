@@ -498,6 +498,26 @@ int sts3215_goto_deg(uint8_t idx, float target_deg, uint16_t speed, uint8_t acc)
         return -1;
     }
 
+    /* ①.5 ★★★ 2026-09-28 新增：先把死区累积器入账，再清零 ★★★
+     *
+     * 死区是【累积式】的：单帧差值先挂在 deadband_accum，攒够 sts3215_deadband(8 刻)
+     * 才计入 total_encoder_value。所以 accum 里的量代表"raw 已经变了、但 total 还没算"
+     * 的真实位移。原实现在函数末尾直接 `deadband_accum = 0`，等于把这份位移【永久丢弃】。
+     *
+     * 危害（实测，本函数在 0x61 通路里被每帧调用 ⇒ 高频写目标时反复丢弃）：
+     *   驱动 J5 走 +20°：raw 实际变化 284 刻(24.96°)，而 total 只记 207 刻(18.19°)
+     *   ⇒ 记录/物理 = 72.9%，系统性少计约 27%。两个后果：
+     *    ① 一致性护栏（用 raw 校验 total）被顶穿（残差 51→128 刻），驱动被周期性拒绝；
+     *    ② 上报角度偏低 ⇒ PC 每帧按少计的 total 重算目标 ⇒ 不断补足缺口
+     *       ⇒ **实际位移超过 PC 要求的目标**（要 20° 走了 24.96°）。
+     *
+     * ★ 顺序很关键：必须放在 ③ 计算 delta_total 【之前】。
+     *   若放在末尾入账，本次的 delta_total 仍按"未入账的 total"算 ⇒ 每帧多走 accum 那么多
+     *   （最多 8 刻 ≈ 0.7°），又会引入一个小的系统性过冲。
+     *   放在这里之后，total 已与 raw 严格对齐，delta_total 就是真实剩余量，无过冲。 */
+    enc->total_encoder_value += enc->deadband_accum;
+    enc->deadband_accum = 0;
+
     /* ② 目标角度 → 目标累计刻度（四舍五入到整数刻度，1 刻度 = 0.0879°） */
     const float   target_total_f = target_deg * (4096.0f / 360.0f);
     const int32_t target_total   = (int32_t)(target_total_f + (target_total_f >= 0.0f ? 0.5f : -0.5f));
@@ -525,9 +545,8 @@ int sts3215_goto_deg(uint8_t idx, float target_deg, uint16_t speed, uint8_t acc)
         return -1;
     }
 
-    /* ⑦ 清死区累积器：否则"被暂扣的差值"会叠加进本次位移，
-     *    使上报角度滞后最多 ±8 刻度(0.7°)，导致 PC 侧的闭环判断偏一点。 */
-    enc->deadband_accum = 0;
+    /* ⑦ 死区累积器已在 ①.5 入账并清零 —— 此处不再动它，
+     *    否则会把"已入账"与"未入账"混在一起（见 ①.5 的说明）。 */
 
     WritePosEx(id, (int16_t)raw_target, speed, acc);
     return 0;
