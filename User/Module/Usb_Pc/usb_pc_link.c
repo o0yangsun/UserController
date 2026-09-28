@@ -88,6 +88,30 @@ volatile float    usb_pc_soft_max_deg[6] = { 85.0f,  170.0f,  170.0f,  170.0f,  
 volatile uint8_t  usb_pc_stall_limit    = 20;     /* 已废弃，保留以兼容旧配置 */
 volatile uint16_t usb_pc_stall_window_ms = 600;   /* 真实时间窗(ms)，0 = 关闭 */
 volatile float    usb_pc_stall_eps_deg  = 0.30f;
+/* ⚠️ eps 隐含一个下限：0.30° / 600ms = 0.5°/s，即"低于 0.5°/s 的运动会被判成堵转"。
+ *    所以 usb_pc_write_speed 不要设得太低（按标定 ≈0.088°/s/unit，speed 需 ≳ 10）。
+ *    量化噪声约 1 刻 = 0.088°，0.30° = 3.4 刻，已留足余量，不宜再调小。 */
+
+/* ★★★ 2026-09-28 新增：堵转的两个修复（详见 usb_pc_arm_write_apply 内的长注释）★★★ */
+
+/* 判定堵转时，是否写一次 goal = 当前角来【卸载】推力。默认 1（开）。
+ * 为什么必须有：舵机是"持有目标"模型 —— 只是"不写新目标"并不会让它停，
+ *   它会继续朝上次写入的 goal（越界方向）顶，机械应力一点没解除。
+ * 关掉它（设 0）则退回"只跳过不卸载"的旧行为：不顶了，但顶限位的应力仍在。 */
+volatile uint8_t  usb_pc_stall_unload    = 1;
+
+/* 自动重试：距上次判定堵转超过本值(ms)才允许重试一次。默认 1000。
+ * 限流的理由：不加限流的话，PC 每帧推进一点目标就会触发一次重试 ⇒ 变成持续顶限位。
+ * 设为 0 = 【永不自动重试】（该路一直保持卸载态，直到发 0x63 或复位才解除）。 */
+volatile uint16_t usb_pc_stall_retry_ms  = 1000;
+
+/* 自动重试的第二个条件：PC 目标相对【判堵转时的目标】变化量超过本值(度)才重试。
+ * 默认 3.0。理由：同一个目标重试没有意义（它已经被证明不可达）；
+ * 目标真的变了才值得再试一次（可能是换了方向 / 换了姿态，限位不再挡路）。
+ *   > 0  : 目标变化需超过该值（默认 3.0°）
+ *   = 0  : 只要目标有任何变化即可
+ *   < 0  : 忽略"目标变化"这一条，只按时间间隔重试（纯时间重试） */
+volatile float    usb_pc_stall_retry_deg = 3.0f;
 
 /* ★★★ 角度估计一致性护栏（安全关键，见 .h 说明）★★★ */
 volatile float    usb_pc_consist_tol_ticks = 50.0f;   /* 容差(刻)，50 刻 ≈ 4.4° */
@@ -97,7 +121,13 @@ volatile float    usb_pc_consist_err_ticks = 0.0f;
 volatile uint32_t usb_pc_write_cnt        = 0;
 volatile uint32_t usb_pc_write_reject_cnt = 0;
 volatile uint32_t usb_pc_write_stale_cnt  = 0;
-volatile uint32_t usb_pc_write_stall_cnt  = 0;
+volatile uint32_t usb_pc_write_stall_cnt  = 0;   /* 堵转【发生次数】（状态跃迁计数）
+                                                  * ⚠️ 语义已变更：旧版是"被跳过的帧数"，
+                                                  *    那会按 ~333/s 增长（实测 2140），看起来像
+                                                  *    "一直在顶"，其实只是在每帧跳过一次而已。 */
+volatile uint32_t usb_pc_write_stall_skip_cnt = 0;   /* 因堵转而跳过该路的【帧数】（旧语义） */
+volatile uint32_t usb_pc_stall_unload_cnt     = 0;   /* 实际执行"卸载"(写 goal=当前角)的次数 */
+volatile uint32_t usb_pc_stall_retry_cnt      = 0;   /* 自动重试放行的次数 */
 volatile uint32_t usb_pc_hold_cnt         = 0;
 volatile float    usb_pc_last_write_deg[6] = {0};
 volatile uint8_t  usb_pc_last_write_idx   = 0;
@@ -113,7 +143,9 @@ static uint32_t s_last_target_ms = 0;   /* 最后一次收到 0x61 的时刻（�
  * 假堵转（慢速运动）会自己解除：它仍在动 → 位置变化 → 基准刷新 ✓ */
 static float    s_stall_ref_deg[6] = {0};   /* 上次"确认有位移"时的角度 */
 static uint32_t s_stall_ref_ms[6]  = {0};   /* 上次"确认有位移"的时刻 */
-static uint8_t  s_stalled[6]       = {0};   /* 1 = 判定卡住中 */
+static uint8_t  s_stalled[6]       = {0};   /* 1 = 判定卡住中（持续跳过该路） */
+static float    s_stall_tgt_deg[6] = {0};   /* 判定堵转时的 PC 目标角 —— 供"目标变了才重试" */
+static uint32_t s_stall_ms[6]      = {0};   /* 判定堵转的时刻 —— 供"重试间隔限流" */
 
 /* ---------------- 校验：sum + 累加和(addr)，与车端逐字节一致 ----------------
  * sum 覆盖 [0 .. 4+dlen-1]（即 帧头..数据末字节），两个校验值都取低 8 位。 */
@@ -419,30 +451,92 @@ uint8_t usb_pc_arm_write_apply(void)
             d = -usb_pc_write_limit_deg;
         }
 
-        /* ★ 堵转保护（2026-09-27 改为按真实时间窗判定，见文件头定义处的说明）：
-         * 上次"确认有位移"到现在超过 usb_pc_stall_window_ms 且位移仍小于 eps
-         * ⇒ 判定顶限位 / 卡住 ⇒ 本帧跳过该路（累加 stall_cnt 供观察）。
-         * 与"命令是否发出"无关，所以正常运动（哪怕是慢速）不会误触发；
-         * 而误判也是自解除的：只要它还在动，基准就会被刷新。 */
+        /* ================= 堵转保护（2026-09-28 重构：修两个真实缺陷） =================
+         * 判定：距上次"确认有位移"超过 usb_pc_stall_window_ms，而位移仍小于 eps
+         *       ⇒ 判定顶限位 / 卡住。
+         *
+         * ★ 修复 1「卸载」——旧实现只 `continue`（不再写新目标），但舵机是"持有目标"模型，
+         *   它仍会继续朝【上次写入的 goal】顶，而那个 goal 正是越界方向 ⇒
+         *   机械应力一点没解除。（stall_cnt 涨到 2140 并不代表"停止出力"，
+         *   那只是"每帧跳过一次"的累计帧数。）
+         *   现在：判定成立的那一刻，写一次 goal = 当前角（等价于对单路做一次 0x63），
+         *   真正把推力卸掉。只在跃迁那一次写，之后每帧纯跳过 ——
+         *   否则每 3ms 一次总线事务，代价太大。
+         *
+         * ★ 修复 2「自恢复」——旧实现里 s_stalled 只能靠"它自己动了"来清除，
+         *   而它不动正是因为被跳过 ⇒ 一旦误判，该路在 0x61 通路上【永久失效】
+         *   （之后怎么发都不动，极易误诊成机械问题）。
+         *   现在改成"两个条件同时满足才放行一次重试"：
+         *     a) 距上次判定堵转 ≥ usb_pc_stall_retry_ms   （限流，避免退化成持续顶限位）
+         *     b) PC 目标相对【判堵转时的目标】变化 ≥ usb_pc_stall_retry_deg
+         *   —— 同一目标重试没有意义（已被证明不可达），目标真变了才值得再试。
+         *   注意：不再用"它动了"来解除 —— 卸载后关节会因重力回落，
+         *   若用"动了就解除"会和"再推回去"形成往复振荡。 */
         if (usb_pc_stall_window_ms > 0u)
         {
-            const float moved = cur[i] - s_stall_ref_deg[i];
+            const uint32_t now_ms = HAL_GetTick();
 
-            if ((moved > usb_pc_stall_eps_deg) || (moved < -usb_pc_stall_eps_deg))
+            if (s_stalled[i] == 0u)
             {
-                s_stall_ref_deg[i] = cur[i];      /* 确实在动：刷新基准与时间戳 */
-                s_stall_ref_ms[i]  = HAL_GetTick();
-                s_stalled[i]       = 0u;
+                const float moved = cur[i] - s_stall_ref_deg[i];
+                const int   moving = (moved > usb_pc_stall_eps_deg) ||
+                                     (moved < -usb_pc_stall_eps_deg);
+
+                if (moving)
+                {
+                    s_stall_ref_deg[i] = cur[i];      /* 确实在动：刷新基准与时间戳 */
+                    s_stall_ref_ms[i]  = now_ms;
+                }
+                else if ((uint32_t)(now_ms - s_stall_ref_ms[i]) >
+                         (uint32_t)usb_pc_stall_window_ms)
+                {
+                    /* ---------- 状态跃迁：判定堵转 ---------- */
+                    s_stalled[i]       = 1u;
+                    s_stall_ms[i]      = now_ms;
+                    s_stall_tgt_deg[i] = usb_pc_target_deg[i];
+                    usb_pc_write_stall_cnt++;         /* 发生【次数】，不是帧数 */
+
+                    /* 修复 1：卸载推力（写 goal = 当前位置） */
+                    if (usb_pc_stall_unload != 0u)
+                    {
+                        if (sts3215_goto_deg(i, cur[i],
+                                             usb_pc_write_speed,
+                                             usb_pc_write_acc) == 0)
+                        {
+                            usb_pc_last_write_deg[i] = cur[i];
+                            usb_pc_last_write_idx    = (uint8_t)(i + 1u);
+                            usb_pc_stall_unload_cnt++;
+                        }
+                    }
+                }
             }
-            else if ((uint32_t)(HAL_GetTick() - s_stall_ref_ms[i]) >
-                     (uint32_t)usb_pc_stall_window_ms)
+            else
             {
-                s_stalled[i] = 1u;
+                /* ---------- 已在堵转态：判是否放行一次重试 ---------- */
+                const float dt = usb_pc_target_deg[i] - s_stall_tgt_deg[i];
+
+                /* retry_deg < 0 ⇒ 忽略目标变化条件（纯时间重试）；= 0 ⇒ 任何变化即可 */
+                const int tgt_ok = (usb_pc_stall_retry_deg < 0.0f)
+                                   ? 1
+                                   : ((dt > usb_pc_stall_retry_deg) ||
+                                      (dt < -usb_pc_stall_retry_deg));
+
+                const int time_ok = (usb_pc_stall_retry_ms != 0u) &&
+                                    ((uint32_t)(now_ms - s_stall_ms[i]) >=
+                                     (uint32_t)usb_pc_stall_retry_ms);
+
+                if (tgt_ok && time_ok)
+                {
+                    usb_pc_stall_retry_cnt++;         /* 放行一次：重新开始判定 */
+                    s_stalled[i]       = 0u;
+                    s_stall_ref_deg[i] = cur[i];
+                    s_stall_ref_ms[i]  = now_ms;
+                }
             }
 
             if (s_stalled[i] != 0u)
             {
-                usb_pc_write_stall_cnt++;         /* 卡住了：本帧跳过这一路 */
+                usb_pc_write_stall_skip_cnt++;        /* 本帧跳过这一路（不产生总线事务） */
                 continue;
             }
         }
@@ -499,12 +593,16 @@ uint8_t usb_pc_arm_hold_now(void)
     usb_pc_target_flag = 0u;
     s_last_target_ms   = 0u;
 
-    /* 顺带把堵转判定清零：刹车后位置基准变了，旧的"没动"判定已无意义 */
+    /* 顺带把堵转判定清零：刹车后位置基准变了，旧的"没动"判定已无意义。
+     * ★ 这一步同时是堵转态【唯一的无条件解除口】—— 所以 0x63 既能刹车，
+     *   也能把"被判堵转而永久跳过"的某一路重新放行。 */
     for (uint8_t i = 0; i < STS3215_NUM; i++)
     {
         s_stall_ref_deg[i] = usb_pc_target_deg[i];
         s_stall_ref_ms[i]  = HAL_GetTick();
         s_stalled[i]       = 0u;
+        s_stall_tgt_deg[i] = usb_pc_target_deg[i];
+        s_stall_ms[i]      = HAL_GetTick();
     }
 
     usb_pc_hold_cnt++;

@@ -165,6 +165,25 @@ extern volatile uint16_t usb_pc_stall_window_ms;
 /* 判定"几乎没位移"的阈值(度)。默认 0.3（读数分辨率为 1 刻 = 0.0879°，故 0.3° 足够灵敏）。 */
 extern volatile float    usb_pc_stall_eps_deg;
 
+/* ============ 2026-09-28 新增：堵转的两个修复 ============
+ * 背景：旧实现 (a) 判堵转后只 `continue`（不再写新目标），但舵机是"持有目标"模型，
+ *       它仍会继续朝上次写入的 goal（越界方向）顶 ⇒ 机械应力没解除；
+ *       (b) `s_stalled` 只能靠"它自己动了"来清除，而它不动正是因为被跳过
+ *       ⇒ 一次误判 = 该路永久失效（之后怎么发都不动，易误诊成机械问题）。
+ * 详见 usb_pc_link.c 内 usb_pc_arm_write_apply() 的长注释。 */
+
+/* 1 = 判定堵转时写一次 goal=当前角，把顶限位的推力【卸载】掉。默认 1。
+ * 设为 0 则退回旧行为（只跳过、不卸载）。 */
+extern volatile uint8_t  usb_pc_stall_unload;
+
+/* 自动重试的限流间隔(ms)，默认 1000。设为 0 = 永不自动重试
+ * （该路一直保持卸载态，只能靠 0x63 或复位解除）。 */
+extern volatile uint16_t usb_pc_stall_retry_ms;
+
+/* 自动重试的目标变化阈值(度)，默认 3.0。
+ *   > 0 : 需超过该值   = 0 : 任何变化即可   < 0 : 忽略变化条件，纯时间重试 */
+extern volatile float    usb_pc_stall_retry_deg;
+
 /* ==================== ★★★ 角度估计一致性护栏（2026-09-27 新增，安全关键）★★★ ====================
  *
  * 为什么必须有它（实测失控事故）：
@@ -190,7 +209,13 @@ extern volatile float    usb_pc_consist_err_ticks;   /* 最近一次的误差量
 extern volatile uint32_t usb_pc_write_cnt;         /* 实际执行移动的关节次数 */
 extern volatile uint32_t usb_pc_write_reject_cnt;  /* 因超过单帧路数闸被拒的帧数 */
 extern volatile uint32_t usb_pc_write_stale_cnt;   /* 因未使能 / 标志为0 / 超时而未执行的次数 */
-extern volatile uint32_t usb_pc_write_stall_cnt;   /* 因堵转保护被跳过的次数 */
+extern volatile uint32_t usb_pc_write_stall_cnt;      /* 堵转【发生次数】（状态跃迁计数）
+                                                        * ⚠️ 语义已变更：旧版是"被跳过的帧数"，
+                                                        *    那会按 ~333/s 增长（实测 2140），
+                                                        *    看着像"一直在顶"，其实只是每帧跳过一次 */
+extern volatile uint32_t usb_pc_write_stall_skip_cnt; /* 因堵转而跳过该路的【帧数】（旧语义） */
+extern volatile uint32_t usb_pc_stall_unload_cnt;     /* 实际执行"卸载"(写 goal=当前角)的次数 */
+extern volatile uint32_t usb_pc_stall_retry_cnt;      /* 自动重试放行的次数 */
 extern volatile uint32_t usb_pc_hold_cnt;          /* 执行过多少次"立即原位保持" */
 extern volatile float    usb_pc_last_write_deg[6]; /* 最近一次实际写入的目标角(度) */
 extern volatile uint8_t  usb_pc_last_write_idx;    /* 最近写入的通道号+1（0=从未写过） */
